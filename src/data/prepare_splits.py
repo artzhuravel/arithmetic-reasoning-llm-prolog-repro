@@ -1,5 +1,5 @@
 from typing import cast, Optional
-from datasets import Dataset
+from datasets import Dataset, DatasetDict, load_from_disk
 from pathlib import Path
 from src.data.hf_loaders import load_gsm8k_prolog, load_openai_gsm8k
 
@@ -49,7 +49,7 @@ def _check_split(gsm8k_prolog_split: Dataset, openai_gsm8k_split: Dataset, split
 def prepare_splits(train_size: Optional[int] = None,
                    test_size:  Optional[int] = None,
                    validation_size:  Optional[int] = None,
-                   seed: int = 42) -> tuple[Dataset, Dataset, Dataset, Dataset, Dataset, Dataset]:
+                   seed: int = 42) -> tuple[DatasetDict, DatasetDict]:
     
     DATA_SPLITS_DIR.mkdir(parents=True, exist_ok=True)
     gsm8k_prolog_train_path = DATA_SPLITS_DIR / "gsm8k_prolog" / "train"
@@ -62,14 +62,20 @@ def prepare_splits(train_size: Optional[int] = None,
     if gsm8k_prolog_train_path.exists() and openai_gsm8k_train_path.exists() and gsm8k_prolog_test_path.exists() and openai_gsm8k_test_path.exists() and gsm8k_prolog_val_path.exists() and openai_gsm8k_val_path.exists():
         print("Splits already exist, loading from disk")
         
-        gsm8k_prolog_train = Dataset.from_parquet(gsm8k_prolog_train_path)
-        openai_gsm8k_train = Dataset.from_parquet(openai_gsm8k_train_path)
-        gsm8k_prolog_test = Dataset.from_parquet(gsm8k_prolog_test_path)
-        openai_gsm8k_test = Dataset.from_parquet(openai_gsm8k_test_path)
-        gsm8k_prolog_val = Dataset.from_parquet(gsm8k_prolog_val_path)
-        openai_gsm8k_val = Dataset.from_parquet(openai_gsm8k_val_path)
-        
-        return cast(Dataset, gsm8k_prolog_train), cast(Dataset, openai_gsm8k_train), cast(Dataset, gsm8k_prolog_test), cast(Dataset, openai_gsm8k_test), cast(Dataset, gsm8k_prolog_val), cast(Dataset, openai_gsm8k_val)
+        gsm8k_prolog_train = cast(Dataset, load_from_disk(str(gsm8k_prolog_train_path)))
+        openai_gsm8k_train = cast(Dataset, load_from_disk(str(openai_gsm8k_train_path)))
+        gsm8k_prolog_test = cast(Dataset, load_from_disk(str(gsm8k_prolog_test_path)))
+        openai_gsm8k_test = cast(Dataset, load_from_disk(str(openai_gsm8k_test_path)))
+        gsm8k_prolog_val = cast(Dataset, load_from_disk(str(gsm8k_prolog_val_path)))
+        openai_gsm8k_val = cast(Dataset, load_from_disk(str(openai_gsm8k_val_path)))
+
+        gsm8k_prolog_splits = DatasetDict(
+            {"train": gsm8k_prolog_train, "val": gsm8k_prolog_val, "test": gsm8k_prolog_test}
+        )
+        openai_gsm8k_splits = DatasetDict(
+            {"train": openai_gsm8k_train, "val": openai_gsm8k_val, "test": openai_gsm8k_test}
+        )
+        return gsm8k_prolog_splits, openai_gsm8k_splits
     
     gsm8k_prolog = load_gsm8k_prolog()
     openai_gsm8k = load_openai_gsm8k()
@@ -106,7 +112,7 @@ def prepare_splits(train_size: Optional[int] = None,
         validation_size = min(100, train_size // 10)
     
     if validation_size > train_size:
-        print(f"Validation size {validation_size} is greater than train size {train_size}, setting validation size to {train_size}")
+        print(f"Validation size {validation_size} is greater than train size {train_size}")
         raise ValueError("Validation size cannot be greater than train size")
 
     # Shuffle train and test indices
@@ -124,15 +130,15 @@ def prepare_splits(train_size: Optional[int] = None,
     train_indices_no_val = train_indices[validation_size:]
 
     # Apply same indices to BOTH datasets to preserve alignment
+    # Extract validation from original train BEFORE reassigning train (val_indices refer to original)
+    gsm8k_prolog_val = gsm8k_prolog_train.select(val_indices)
+    openai_gsm8k_val = openai_gsm8k_train.select(val_indices)
 
     gsm8k_prolog_train = gsm8k_prolog_train.select(train_indices_no_val)
     openai_gsm8k_train = openai_gsm8k_train.select(train_indices_no_val)
 
     gsm8k_prolog_test = gsm8k_prolog_test.select(test_indices)
     openai_gsm8k_test = openai_gsm8k_test.select(test_indices)
-
-    gsm8k_prolog_val = gsm8k_prolog_train.select(val_indices)
-    openai_gsm8k_val = openai_gsm8k_train.select(val_indices)
     
     # Save splits
     gsm8k_prolog_train.save_to_disk(gsm8k_prolog_train_path)
@@ -143,4 +149,11 @@ def prepare_splits(train_size: Optional[int] = None,
     openai_gsm8k_val.save_to_disk(openai_gsm8k_val_path)
     print(f"Saved splits to {DATA_SPLITS_DIR}")
     
-    return gsm8k_prolog_train, openai_gsm8k_train, gsm8k_prolog_test, openai_gsm8k_test, gsm8k_prolog_val, openai_gsm8k_val
+    gsm8k_prolog_splits = DatasetDict(
+        {"train": gsm8k_prolog_train, "val": gsm8k_prolog_val, "test": gsm8k_prolog_test}
+    )
+    openai_gsm8k_splits = DatasetDict(
+        {"train": openai_gsm8k_train, "val": openai_gsm8k_val, "test": openai_gsm8k_test}
+    )
+
+    return gsm8k_prolog_splits, openai_gsm8k_splits

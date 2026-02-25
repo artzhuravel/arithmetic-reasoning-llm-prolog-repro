@@ -1,0 +1,17 @@
+{
+  "dataset_name": "gsm8k_proper",
+  "ratio": "ratio_1to1",
+  "permutations_per_sample": 1,
+  "seed": 42,
+  "max_component_perms": 10,
+  "max_outputs_per_sample": null,
+  "permute_directives_too": false,
+  "shuffle_augmented_train": true,
+  "counts": {
+    "train_original": 7373,
+    "train_permuted_added": 7364,
+    "train_final": 14737,
+    "val": 100,
+    "test": 1319
+  }
+}
