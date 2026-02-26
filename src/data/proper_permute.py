@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import Any, List, Tuple, Optional, TypeVar, cast
-from itertools import permutations
+
+from itertools import permutations, product
 import random
 
 from datasets import Dataset, DatasetDict, concatenate_datasets, load_from_disk
 
 from src.data.prepare_splits import DATA_SPLITS_DIR, prepare_splits
+from src.prolog.execute import execute_solve, normalize_answer_for_eval
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -20,6 +23,9 @@ PROPER_PERMUTED_INSTRUCTION = (
     "Please generate a piece of Prolog code in non-sequential order "
     "to solve the given math problem."
 )
+_GSM8K_FINAL_ANSWER_RE = re.compile(r"####\s*([-+]?[0-9][0-9,]*(?:\.[0-9]+)?)")
+
+T = TypeVar("T")
 
 
 def get_directives_facts_and_predicates(output: str) -> Tuple[List[str], List[str], List[List[str]]]:
@@ -39,9 +45,18 @@ def get_directives_facts_and_predicates(output: str) -> Tuple[List[str], List[st
         if l.lstrip().startswith(":-"):
             directives.append(l)
             continue
+        
+        # Predicate body lines
+        if in_predicate:
+            cur_predicate.append(l)
+            if l.endswith("."):
+                predicates.append(cur_predicate)
+                cur_predicate = []
+                in_predicate = False
+            continue
 
         # Start of a rule/predicate
-        if (not in_predicate) and (":-" in l) and (not l.lstrip().startswith(":-")):
+        if ":-" in l:
             in_predicate = True
             cur_predicate = [l]
             # one-line rule ending with "."
@@ -52,63 +67,40 @@ def get_directives_facts_and_predicates(output: str) -> Tuple[List[str], List[st
             continue
 
         # Facts: top-level, ends with ".", not indented, and not a rule head
-        if (not in_predicate) and (not l.startswith(" ")) and l.endswith(".") and (":-" not in l):
+        if l.endswith("."):
             facts.append(l)
             continue
-
-        # Predicate body lines
-        if in_predicate:
-            cur_predicate.append(l)
-            if l.endswith("."):
-                predicates.append(cur_predicate)
-                cur_predicate = []
-                in_predicate = False
-            continue
-
-        # Fallback: treat as fact if it looks like a top-level clause
-        if (not l.startswith(" ")) and l.endswith("."):
-            facts.append(l)
 
     return directives, facts, predicates
-
-T = TypeVar("T")
 
 
 def _sample_permutations(
     items: List[T],
     *,
-    max_count: Optional[int] = None,
-    rng: Optional[random.Random] = None,
+    max_count: int | float = float("inf"),
+    rng: random.Random = random.Random(42),
 ) -> List[Tuple[T, ...]]:
     """
     Return up to `max_count` permutations without materializing the full factorial set.
-    When capped, we stop early after collecting enough permutations (paper-aligned iterator behavior).
+    When capped, we stop early after collecting enough permutations.
     """
     items_for_perm = list(items)
-    if rng is not None and len(items_for_perm) > 1:
-        # Shuffle the base order to vary which first-k permutations we observe while staying reproducible.
-        rng.shuffle(items_for_perm)
-
-    perm_iter = permutations(items_for_perm)
-    if max_count is None:
-        return list(perm_iter)
-
-    if max_count <= 0:
-        return []
+    # Shuffle the base order to vary which first-k permutations we observe.
+    rng.shuffle(items_for_perm)
 
     out: List[Tuple[T, ...]] = []
-    for perm in perm_iter:
-        out.append(perm)
+    for perm in permutations(items_for_perm):
         if len(out) >= max_count:
-            break
+            return out
+        out.append(perm)
     return out
 
 
 def permute_directives(
     directives: List[str],
     *,
-    max_count: Optional[int] = None,
-    rng: Optional[random.Random] = None,
+    max_count: int | float = float("inf"),
+    rng: random.Random = random.Random(42),
 ) -> List[Tuple[str, ...]]:
     return _sample_permutations(directives, max_count=max_count, rng=rng)
 
@@ -116,81 +108,29 @@ def permute_directives(
 def permute_facts(
     facts: List[str],
     *,
-    max_count: Optional[int] = None,
-    rng: Optional[random.Random] = None,
+    max_count: int | float = float("inf"),
+    rng: random.Random = random.Random(42),
 ) -> List[Tuple[str, ...]]:
     return _sample_permutations(facts, max_count=max_count, rng=rng)
 
+
 def _strip_goal_terminator(line: str) -> str:
-    s = line.strip()
-    if s.endswith(",") or s.endswith("."):
-        s = s[:-1].rstrip()
-    return s
-
-def _split_goals_top_level(body: str) -> List[str]:
-    """Split an inline rule body on top-level commas only."""
-    parts: List[str] = []
-    cur: List[str] = []
-    depth_paren = depth_brace = depth_bracket = 0
-
-    for ch in body:
-        if ch == "(":
-            depth_paren += 1
-        elif ch == ")":
-            depth_paren = max(0, depth_paren - 1)
-        elif ch == "{":
-            depth_brace += 1
-        elif ch == "}":
-            depth_brace = max(0, depth_brace - 1)
-        elif ch == "[":
-            depth_bracket += 1
-        elif ch == "]":
-            depth_bracket = max(0, depth_bracket - 1)
-
-        if (
-            ch == ","
-            and depth_paren == 0
-            and depth_brace == 0
-            and depth_bracket == 0
-        ):
-            part = "".join(cur).strip()
-            if part:
-                parts.append(part)
-            cur = []
-            continue
-        cur.append(ch)
-
-    tail = "".join(cur).strip()
-    if tail:
-        parts.append(tail)
-    return parts
+    if line.endswith(",") or line.endswith("."):
+        return line[:-1].rstrip()
+    return line
 
 
 def get_predicate_variations(
     predicate: List[str],
     *,
-    max_variations: Optional[int] = None,
-    rng: Optional[random.Random] = None,
+    max_variations: int | float = float("inf"),
+    rng: random.Random = random.Random(42),
 ) -> List[str]:
     if not predicate:
         return []
 
     head = predicate[0].rstrip()
-
-    # If head already contains ":-", keep it; otherwise add it.
-    head_has_colon_dash = ":-" in head and (not head.lstrip().startswith(":-"))
-    head_prefix = head if head_has_colon_dash else (head + " :-")
-
-    goals: List[str] = []
-    if len(predicate) == 1 and head_has_colon_dash:
-        # One-line rule, e.g. "solve(X) :- a(X), b(X)."
-        head_part, body_part = head.split(":-", 1)
-        head_prefix = head_part.rstrip() + " :-"
-        body = _strip_goal_terminator(body_part)
-        goals = [g for g in _split_goals_top_level(body) if g]
-    else:
-        goals = [_strip_goal_terminator(p) for p in predicate[1:]]
-        goals = [g for g in goals if g]
+    goals = [_strip_goal_terminator(p) for p in predicate[1:]]
 
     # If parsing yields no goals (e.g. malformed/unsupported clause layout), return original clause.
     if not goals:
@@ -198,149 +138,163 @@ def get_predicate_variations(
 
     predicate_variations: List[str] = []
     for perm in _sample_permutations(goals, max_count=max_variations, rng=rng):
-        predicate_variations.append(head_prefix + "\n    " + ",\n    ".join(perm) + ".\n")
+        predicate_variations.append(head + "\n    " + ",\n    ".join(perm) + ".\n")
     return predicate_variations
+
 
 def get_all_output_variations(
     output: str,
     *,
-    max_outputs: int = 10,
-    max_component_perms: int = 10,
-    seed: Optional[int] = 42,
+    max_outputs: int | float  = float("inf"),
+    max_component_perms: int | float = float("inf"),
+    max_predicate_variations: int | float = float("inf"),
+    seed: int = 42,
     permute_directives_too: bool = False,
+    correct_answer: Optional[Any] = None,
 ) -> List[str]:
     """
     Generate up to `max_outputs` semantically equivalent Prolog outputs by permuting:
-      - directives order (optional)
+      - directives order (optional; disabled by default)
       - facts order
-      - goal order within each predicate body
       - predicate clause order (if multiple predicates)
 
     Uses and builds on:
       - get_directives_facts_and_predicates
-      - permute_directives
       - permute_facts
-      - get_predicate_variations
+      - permute_predicates
 
     Notes:
       - The cartesian product can explode, so we cap each component pool to
         `max_component_perms` and then sample combinations until we have `max_outputs`.
       - Returned outputs are deduplicated by exact string.
+      - If `correct_answer` is provided, candidate permutations are executed and
+        only kept when the result matches the expected answer.
     """
+    if max_outputs <= 0 or max_component_perms <= 0:
+        return []
+
     rng = random.Random(seed)
+    original_canonical = output.strip()
+    expected_answer_normalized = (
+        normalize_answer_for_eval(correct_answer) if correct_answer is not None else None
+    )
 
     directives, facts, predicates = get_directives_facts_and_predicates(output)
 
-    # Directives pool
+    # Directives pool (optional)
     if permute_directives_too and len(directives) > 1:
-        dir_perms = permute_directives(
+        directive_perms = permute_directives(
             directives, max_count=max_component_perms, rng=rng
         )
     else:
-        dir_perms = [tuple(directives)]
+        directive_perms = [tuple(directives)]
 
     # Facts pool
-    if len(facts) > 1:
-        fact_perms = permute_facts(facts, max_count=max_component_perms, rng=rng)
-    else:
-        fact_perms = [tuple(facts)]
+    fact_perms = permute_facts(facts, max_count=max_component_perms, rng=rng)
 
     # Per-predicate goal-variation pools (each is a list[str] of full predicate clauses)
-    predicate_variation_pools: List[List[str]] = []
-    for p in predicates:
-        vars_for_p = get_predicate_variations(
-            p, max_variations=max_component_perms, rng=rng
-        )
-        predicate_variation_pools.append(vars_for_p)
+    predicate_perms = _sample_permutations(list(range(len(predicates))), max_count=max_component_perms, rng=rng)
+    
+    predicate_vars: List[List[str]] = []
+    for predicate in predicates:
+        predicate_vars.append(get_predicate_variations(predicate, max_variations=max_predicate_variations, rng=rng))
 
-    # Predicate-order pool (permutations of predicate indices)
-    pred_count = len(predicate_variation_pools)
-    if pred_count <= 1:
-        pred_orders = [tuple(range(pred_count))]
-    else:
-        pred_orders = _sample_permutations(
-            list(range(pred_count)),
-            max_count=max_component_perms,
-            rng=rng,
-        )
-
-    def assemble_one(dirs: Tuple[str, ...], fcts: Tuple[str, ...], pred_clauses_in_order: List[str]) -> str:
+    def assemble_output(directives: Tuple[str, ...], facts: Tuple[str, ...], predicates: Tuple[str, ...]) -> str:
         parts: List[str] = []
 
-        if dirs:
-            parts.append("\n".join(dirs))
-        if fcts:
-            # separate directives and facts by a blank line if both exist
-            if parts:
-                parts.append("")
-            parts.append("\n".join(fcts))
-        if pred_clauses_in_order:
-            if parts:
-                parts.append("")
-            # predicates themselves already end with "\n" in get_predicate_variations,
-            # but we normalize spacing: separate clauses by one blank line.
-            norm_preds = [pc.rstrip("\n") for pc in pred_clauses_in_order]
-            parts.append("\n\n".join(norm_preds))
+        if directives:
+            parts.append("\n".join(directives) + "\n")
+        if facts:
+            parts.append("\n".join(facts) + "\n")
+        if predicates:
+            parts.append("\n".join(predicates))
 
         out = "\n".join(parts).rstrip() + "\n"
         return out
 
-    # If there are no predicates, we can still return directive/fact permutations
+
+    
+    # Precompute predicate variation combos once per predicate order
+    predicate_combo_sets: List[Tuple[Tuple[str, ...], ...]] = []
+    for order in predicate_perms:
+        predicate_vars_for_perm = [predicate_vars[k] for k in order]
+        all_combos = tuple(product(*predicate_vars_for_perm))
+        predicate_combo_sets.append(all_combos)
+
+    # Then build full combinations
+    full_perm_pairs: List[Tuple[int, int, Tuple[str, ...]]] = []
+    for d in range(len(directive_perms)):
+        for i in range(len(fact_perms)):
+            for all_combos in predicate_combo_sets:
+                for predicate_perm in all_combos:
+                    full_perm_pairs.append((d, i, predicate_perm))
+            
+    rng.shuffle(full_perm_pairs)
+    
     results: List[str] = []
-    seen: set[str] = set()
-    if pred_count == 0:
-        for dirs in dir_perms:
-            for fcts in fact_perms:
-                s = assemble_one(tuple(dirs), tuple(fcts), [])
-                if s not in seen:
-                    seen.add(s)
-                    results.append(s)
-                if len(results) >= max_outputs:
-                    return results
-        return results
-
-    # Sample full combinations without exploding.
-    # Put a conservative cap on attempts to avoid pathological loops in high-duplication cases.
-    max_attempts = max_outputs * 500
-
-    attempts = 0
-    while len(results) < max_outputs and attempts < max_attempts:
-        attempts += 1
-
-        dirs = rng.choice(dir_perms)
-        fcts = rng.choice(fact_perms)
-        order = rng.choice(pred_orders)
-
-        chosen_preds: List[str] = []
-        for idx in order:
-            pool = predicate_variation_pools[idx]
-            chosen_preds.append(rng.choice(pool))
-
-        s = assemble_one(tuple(dirs), tuple(fcts), chosen_preds)
-        if s in seen:
+    canonical_output = output.strip()
+    for d, i, predicates in full_perm_pairs:
+        if len(results) >= max_outputs:
+            return results
+        directives = directive_perms[d]
+        facts = fact_perms[i]
+        s = assemble_output(tuple(directives), tuple(facts), tuple(predicates))
+        if s.strip() == canonical_output:
             continue
-        seen.add(s)
+        if expected_answer_normalized is not None:
+            exec_result = execute_solve(s)
+            if (not exec_result.ok or 
+                exec_result.normalized_answer != expected_answer_normalized):
+                continue
         results.append(s)
-
-    # If sampling didn't fill, do a small deterministic sweep as a fallback.
-    if len(results) < max_outputs:
-        for dirs in dir_perms:
-            for fcts in fact_perms:
-                for order in pred_orders:
-                    # choose first variation per predicate for deterministic coverage
-                    chosen_preds = [predicate_variation_pools[i][0] for i in order]
-                    s = assemble_one(tuple(dirs), tuple(fcts), chosen_preds)
-                    if s not in seen:
-                        seen.add(s)
-                        results.append(s)
-                    if len(results) >= max_outputs:
-                        return results
 
     return results
 
 
 def _canonicalize_output(output: str) -> str:
     return output.strip()
+
+
+def _extract_openai_gsm8k_final_answer(answer_text: str) -> str:
+    """
+    Extract the final GSM8K answer from the OpenAI format (`...\\n#### <number>`)
+    and normalize it to the Prolog-eval comparison format.
+    """
+    m = _GSM8K_FINAL_ANSWER_RE.search(answer_text)
+    if m is None:
+        raise ValueError("Could not find final GSM8K answer marker ('#### <number>').")
+    raw = m.group(1).replace(",", "")
+    return normalize_answer_for_eval(raw)
+
+
+def get_gsm8k_prolog_train_correct_answers() -> List[str]:
+    """
+    Return normalized gold answers aligned by index to `gsm8k_prolog/train`,
+    extracted from `openai_gsm8k/train`.
+    """
+    prolog_train_path = DATA_SPLITS_DIR / "gsm8k_prolog" / "train"
+    openai_train_path = DATA_SPLITS_DIR / "openai_gsm8k" / "train"
+
+    if not (prolog_train_path.exists() and openai_train_path.exists()):
+        # Ensure prepared aligned splits exist, then read them from disk.
+        prepare_splits()
+
+    prolog_train = cast(Dataset, load_from_disk(str(prolog_train_path)))
+    openai_train = cast(Dataset, load_from_disk(str(openai_train_path)))
+
+    if len(prolog_train) != len(openai_train):
+        raise ValueError(
+            "Prepared train splits are not aligned by length: "
+            f"gsm8k_prolog/train={len(prolog_train)} vs openai_gsm8k/train={len(openai_train)}"
+        )
+
+    answers: List[str] = []
+    for i in range(len(prolog_train)):
+        # Lightweight alignment guard (prepare_splits should already guarantee this).
+        if str(prolog_train[i]["input"]).strip() != str(openai_train[i]["question"]).strip():
+            raise ValueError(f"Train split question mismatch at index {i}.")
+        answers.append(_extract_openai_gsm8k_final_answer(str(openai_train[i]["answer"])))
+    return answers
 
 
 def _ratio_dir_name(permutations_per_sample: int) -> str:
@@ -355,7 +309,7 @@ def _ensure_prepared_gsm8k_prolog_splits(
     seed: int = 42,
 ) -> tuple[Dataset, Dataset, Dataset]:
     """
-    Load leakage-safe prepared splits from disk if present; otherwise create them via prepare_splits().
+    Load prepared splits from disk if present; otherwise create them via prepare_splits().
 
     Returns only the Prolog splits: (train, val, test).
     """
@@ -404,7 +358,7 @@ def _build_permuted_rows(
     permute_directives_too: bool,
 ) -> list[dict[str, Any]]:
     """
-    Generate PROPER rows (train-only) and return them as plain dict rows.
+    Generate PROPER rows nd return them as plain dict rows.
     Original rows are NOT included here.
     """
     generated_rows: list[dict[str, Any]] = []
@@ -420,7 +374,6 @@ def _build_permuted_rows(
     for idx in range(len(train_split)):
         row = train_split[idx]
         original_output = row["output"]
-        original_canonical = _canonicalize_output(original_output)
 
         variations = get_all_output_variations(
             original_output,
@@ -430,26 +383,13 @@ def _build_permuted_rows(
             permute_directives_too=permute_directives_too,
         )
 
-        # Remove duplicates and the identity/original sample.
-        unique_candidates: list[str] = []
-        seen: set[str] = set()
-        for v in variations:
-            canon = _canonicalize_output(v)
-            if canon == original_canonical or canon in seen:
-                continue
-            seen.add(canon)
-            unique_candidates.append(v)
-
-        if not unique_candidates:
-            continue
-
-        local_rng = random.Random(seed + idx)
-        if len(unique_candidates) > permutations_per_sample:
-            chosen_outputs = local_rng.sample(unique_candidates, k=permutations_per_sample)
+        if len(variations) > permutations_per_sample:
+            local_rng = random.Random(seed + idx)
+            chosen_outputs = local_rng.sample(variations, k=permutations_per_sample)
         else:
-            chosen_outputs = unique_candidates
+            chosen_outputs = variations
 
-        for perm_i, permuted_output in enumerate(chosen_outputs):
+        for permuted_output in chosen_outputs:
             new_row = dict(row)
             new_row["instruction"] = PROPER_PERMUTED_INSTRUCTION
             new_row["output"] = permuted_output
