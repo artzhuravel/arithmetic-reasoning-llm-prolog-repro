@@ -179,7 +179,7 @@ def get_all_output_variations(
         normalize_answer_for_eval(correct_answer) if correct_answer is not None else None
     )
 
-    directives, facts, predicates = get_directives_facts_and_predicates(output)
+    directives, facts, predicates_clauses = get_directives_facts_and_predicates(output)
 
     # Directives pool (optional)
     if permute_directives_too and len(directives) > 1:
@@ -193,10 +193,10 @@ def get_all_output_variations(
     fact_perms = permute_facts(facts, max_count=max_component_perms, rng=rng)
 
     # Per-predicate goal-variation pools (each is a list[str] of full predicate clauses)
-    predicate_perms = _sample_permutations(list(range(len(predicates))), max_count=max_component_perms, rng=rng)
+    predicate_perms = _sample_permutations(list(range(len(predicates_clauses))), max_count=max_component_perms, rng=rng)
     
-    predicate_vars: List[List[str]] = []
-    for predicate in predicates:
+    predicate_vars: List[List[str]] = [] # Per each predicate clause, we have a list of variations
+    for predicate in predicates_clauses:
         predicate_vars.append(get_predicate_variations(predicate, max_variations=max_predicate_variations, rng=rng))
 
     def assemble_output(directives: Tuple[str, ...], facts: Tuple[str, ...], predicates: Tuple[str, ...]) -> str:
@@ -211,42 +211,49 @@ def get_all_output_variations(
 
         out = "\n".join(parts).rstrip() + "\n"
         return out
-
-
     
-    # Precompute predicate variation combos once per predicate order
-    predicate_combo_sets: List[Tuple[Tuple[str, ...], ...]] = []
-    for order in predicate_perms:
-        predicate_vars_for_perm = [predicate_vars[k] for k in order]
-        all_combos = tuple(product(*predicate_vars_for_perm))
-        predicate_combo_sets.append(all_combos)
+    # Precompute all possible predicate combinations
+    predicates_perms: List[Tuple[str, ...]] = []
+    for predicate_order in predicate_perms:
+        predicate_vars_for_perm = [predicate_vars[i] for i in predicate_order]
+        predicates_perms.extend(product(*predicate_vars_for_perm))
 
     # Then build full combinations
-    full_perm_pairs: List[Tuple[int, int, Tuple[str, ...]]] = []
+    n_facts_permutations = len(fact_perms)
+    n_predicates_permutations = len(predicates_perms)
+    
+    full_perm_pairs: set[Tuple[int, int, int]] = set()
     for d in range(len(directive_perms)):
-        for i in range(len(fact_perms)):
-            for all_combos in predicate_combo_sets:
-                for predicate_perm in all_combos:
-                    full_perm_pairs.append((d, i, predicate_perm))
-            
-    rng.shuffle(full_perm_pairs)
+        for f in range(n_facts_permutations):
+            for p in range(n_predicates_permutations):
+                full_perm_pairs.add((d, f, p))
     
     results: List[str] = []
     canonical_output = output.strip()
-    for d, i, predicates in full_perm_pairs:
-        if len(results) >= max_outputs:
-            return results
-        directives = directive_perms[d]
-        facts = fact_perms[i]
-        s = assemble_output(tuple(directives), tuple(facts), tuple(predicates))
-        if s.strip() == canonical_output:
-            continue
-        if expected_answer_normalized is not None:
-            exec_result = execute_solve(s)
-            if (not exec_result.ok or 
-                exec_result.normalized_answer != expected_answer_normalized):
+    
+    if max_outputs == float("inf"):
+        need_outputs = len(full_perm_pairs)
+    else:
+        need_outputs = max_outputs
+    
+    need_outputs = max_outputs
+    while full_perm_pairs and need_outputs > 0:
+        k = int(min(need_outputs, len(full_perm_pairs)))
+        picked = rng.sample(list(full_perm_pairs), k=k)
+        
+        for d, f, p in picked:
+            s = assemble_output(tuple(directive_perms[d]), tuple(fact_perms[f]), tuple(predicates_perms[p]))
+            if s.strip() == canonical_output:
                 continue
-        results.append(s)
+            if expected_answer_normalized is not None:
+                exec_result = execute_solve(s)
+                if (not exec_result.ok or 
+                    exec_result.normalized_answer != expected_answer_normalized):
+                    continue
+            need_outputs -= 1
+            results.append(s)
+        
+        full_perm_pairs.difference_update(picked)
 
     return results
 
