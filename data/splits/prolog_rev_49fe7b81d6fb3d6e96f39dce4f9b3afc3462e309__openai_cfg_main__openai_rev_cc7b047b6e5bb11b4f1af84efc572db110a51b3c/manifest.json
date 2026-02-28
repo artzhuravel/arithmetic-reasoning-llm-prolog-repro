@@ -1,0 +1,10 @@
+{
+  "prolog_revision": "49fe7b81d6fb3d6e96f39dce4f9b3afc3462e309",
+  "openai_config": "main",
+  "openai_revision": "cc7b047b6e5bb11b4f1af84efc572db110a51b3c",
+  "counts": {
+    "train": 7358,
+    "val": 100,
+    "test": 1315
+  }
+}

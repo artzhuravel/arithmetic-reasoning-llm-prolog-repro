@@ -41,6 +41,33 @@ def _normalize_query(query: str) -> str:
     return q
 
 
+def _strip_matching_quotes(s: str) -> str:
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        return s[1:-1]
+    return s
+
+
+def _coerce_numeric_text_to_float_str(s: str) -> str | None:
+    t = s.strip()
+    m = _SWI_RATIONAL_RE.fullmatch(t)
+    if m:
+        num = int(m.group(1))
+        den = int(m.group(2))
+        if den == 0:
+            return None
+        try:
+            with localcontext() as ctx:
+                ctx.prec = 28
+                dec = Decimal(num) / Decimal(den)
+            return str(float(dec))
+        except (InvalidOperation, OverflowError, ZeroDivisionError):
+            return None
+    try:
+        return str(float(t))
+    except ValueError:
+        return None
+
+
 def normalize_answer_for_eval(answer: Any) -> str:
     """
     Normalize Prolog answer into a standard float-string representation.
@@ -54,45 +81,32 @@ def normalize_answer_for_eval(answer: Any) -> str:
         return ""
     s = str(answer).strip()
 
-    # SWI-Prolog may print exact rationals as e.g. "10r3" (especially from clpq).
-    # Convert these to float strings automatically.
-    m = _SWI_RATIONAL_RE.fullmatch(s)
-    if m:
-        num = int(m.group(1))
-        den = int(m.group(2))
-        if den == 0:
-            return s
-        try:
-            with localcontext() as ctx:
-                ctx.prec = 28
-                dec = Decimal(num) / Decimal(den)
-            return str(float(dec))
-        except (InvalidOperation, OverflowError, ZeroDivisionError):
-            return s
+    numeric = _coerce_numeric_text_to_float_str(s)
+    if numeric is not None:
+        return numeric
 
-    try:
-        return str(float(s))
-    except ValueError:
-        pass
+    unquoted = _strip_matching_quotes(s)
+    if unquoted != s:
+        numeric = _coerce_numeric_text_to_float_str(unquoted)
+        if numeric is not None:
+            return numeric
 
     return s
 
 
 def _parse_prolog_result_text(raw: str) -> Any:
     s = raw.strip()
-    m = _SWI_RATIONAL_RE.fullmatch(s)
-    if m:
-        num = int(m.group(1))
-        den = int(m.group(2))
-        if den != 0:
-            try:
-                with localcontext() as ctx:
-                    ctx.prec = 28
-                    dec = Decimal(num) / Decimal(den)
-                return float(dec)
-            except (InvalidOperation, OverflowError, ZeroDivisionError):
-                return s
-        return s
+
+    numeric = _coerce_numeric_text_to_float_str(s)
+    if numeric is not None:
+        return float(numeric)
+
+    unquoted = _strip_matching_quotes(s)
+    if unquoted != s:
+        numeric = _coerce_numeric_text_to_float_str(unquoted)
+        if numeric is not None:
+            return float(numeric)
+
     try:
         return float(s)
     except ValueError:

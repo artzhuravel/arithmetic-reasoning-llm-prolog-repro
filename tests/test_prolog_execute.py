@@ -14,7 +14,7 @@ This test verifies:
 import shutil
 import pytest
 
-from src.prolog.execute import execute_solve, execute_prolog_string, PrologExecutionResult
+from src.prolog.execute import execute_solve, PrologExecutionResult
 
 
 # Simple integer result (paper Figure 1 example)
@@ -121,6 +121,8 @@ def test_answer_normalization_for_eval() -> None:
     assert normalize_answer_for_eval("1r2") == "0.5"
     assert normalize_answer_for_eval("10r3").startswith("3.333333")
     assert "r" not in normalize_answer_for_eval("10r3")
+    assert normalize_answer_for_eval("'11026'") == "11026.0"
+    assert normalize_answer_for_eval('"11026"') == "11026.0"
     assert normalize_answer_for_eval(None) == ""
 
 
