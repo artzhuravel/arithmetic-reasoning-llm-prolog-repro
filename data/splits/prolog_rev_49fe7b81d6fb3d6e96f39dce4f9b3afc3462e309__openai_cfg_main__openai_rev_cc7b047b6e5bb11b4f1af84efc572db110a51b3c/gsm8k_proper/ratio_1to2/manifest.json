@@ -1,0 +1,20 @@
+{
+  "dataset_name": "gsm8k_proper",
+  "splits_dir": "/Users/azh/arithmetic-reasoning-llm-prolog-repro/data/splits/prolog_rev_49fe7b81d6fb3d6e96f39dce4f9b3afc3462e309__openai_cfg_main__openai_rev_cc7b047b6e5bb11b4f1af84efc572db110a51b3c",
+  "ratio": "ratio_1to2",
+  "permutations_per_sample": 2,
+  "seed": 42,
+  "max_intra_component_perms": 10,
+  "max_intra_predicate_perms": 10,
+  "max_outputs_per_sample": 100,
+  "permute_directives_too": false,
+  "shuffle_augmented_train": true,
+  "workers": 10,
+  "counts": {
+    "train_original": 7358,
+    "train_permuted_added": 13818,
+    "train_final": 21176,
+    "val": 100,
+    "test": 1315
+  }
+}

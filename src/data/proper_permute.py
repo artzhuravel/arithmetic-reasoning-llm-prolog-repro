@@ -155,9 +155,9 @@ def get_predicate_variations(
 def get_all_output_variations(
     output: str,
     *,
-    max_outputs: int | float  = 10,
-    max_component_perms: int | float = float("inf"),
-    max_predicate_variations: int | float = float("inf"),
+    max_outputs: Optional[int | float] = float("inf"),
+    max_intra_component_perms: int | float = float("inf"),
+    max_intra_predicate_perms: int | float = float("inf"),
     seed: int = 42,
     permute_directives_too: bool = False,
     correct_answer: Optional[Any] = None,
@@ -175,16 +175,18 @@ def get_all_output_variations(
 
     Notes:
       - The cartesian product can explode, so we cap each component pool to
-        `max_component_perms` and then sample combinations until we have `max_outputs`.
+        `max_intra_component_perms` and then sample combinations until we have `max_outputs`.
       - Returned outputs are deduplicated by exact string.
       - If `correct_answer` is provided, candidate permutations are executed and
         only kept when the result matches the expected answer.
     """
-    if max_outputs <= 0 or max_component_perms <= 0:
+    
+    if max_intra_component_perms <= 0 or max_intra_predicate_perms <= 0:
+        return []
+    if max_outputs is not None and max_outputs <= 0:
         return []
 
     rng = random.Random(seed)
-    original_canonical = output.strip()
     expected_answer_normalized = (
         normalize_answer_for_eval(correct_answer) if correct_answer is not None else None
     )
@@ -194,20 +196,20 @@ def get_all_output_variations(
     # Directives pool (optional)
     if permute_directives_too and len(directives) > 1:
         directive_perms = permute_directives(
-            directives, max_count=max_component_perms, rng=rng
+            directives, max_count=max_intra_component_perms, rng=rng
         )
     else:
         directive_perms = [tuple(directives)]
 
     # Facts pool
-    fact_perms = permute_facts(facts, max_count=max_component_perms, rng=rng)
+    fact_perms = permute_facts(facts, max_count=max_intra_component_perms, rng=rng)
 
-    # Per-predicate goal-variation pools (each is a list[str] of full predicate clauses)
-    predicate_perms = _sample_permutations(list(range(len(predicates_clauses))), max_count=max_component_perms, rng=rng)
+    # Get inter-predicate permutations
+    predicate_perms = _sample_permutations(list(range(len(predicates_clauses))), max_count=max_intra_component_perms, rng=rng)
     
     predicate_vars: List[List[str]] = [] # Per each predicate clause, we have a list of variations
     for predicate in predicates_clauses:
-        predicate_vars.append(get_predicate_variations(predicate, max_variations=max_predicate_variations, rng=rng))
+        predicate_vars.append(get_predicate_variations(predicate, max_variations=max_intra_predicate_perms, rng=rng))
 
     def assemble_output(directives: Tuple[str, ...], facts: Tuple[str, ...], predicates: Tuple[str, ...]) -> str:
         parts: List[str] = []
@@ -241,12 +243,11 @@ def get_all_output_variations(
     results: List[str] = []
     canonical_output = output.strip()
     
-    if max_outputs == float("inf"):
+    if max_outputs is None or max_outputs == float("inf"):
         need_outputs = len(full_perm_pairs)
     else:
         need_outputs = max_outputs
 
-    need_outputs = max_outputs
     while full_perm_pairs and need_outputs > 0:
         k = int(min(need_outputs, len(full_perm_pairs)))
         picked = rng.sample(list(full_perm_pairs), k=k)
@@ -424,7 +425,8 @@ def _build_permuted_rows(
     *,
     ground_truth_by_prompt: dict[str, float],
     permutations_per_sample: int,
-    max_component_perms: Optional[int],
+    max_intra_component_perms: Optional[int],
+    max_intra_predicate_perms: Optional[int],
     max_outputs_per_sample: Optional[int],
     seed: int,
     permute_directives_too: bool,
@@ -440,13 +442,6 @@ def _build_permuted_rows(
         return generated_rows
     if workers <= 0:
         raise ValueError("workers must be greater than 0")
-
-    # By default, generate the full candidate space and only cap at selection time.
-    requested_candidates: int | float
-    if max_outputs_per_sample is None:
-        requested_candidates = float("inf")
-    else:
-        requested_candidates = max_outputs_per_sample
 
     indexed_rows: list[tuple[int, dict[str, Any]]] = [
         (idx, dict(train_split[idx])) for idx in range(len(train_split))
@@ -464,8 +459,9 @@ def _build_permuted_rows(
 
         variations = get_all_output_variations(
             original_output,
-            max_outputs=requested_candidates,
-            max_component_perms=max_component_perms if max_component_perms is not None else float("inf"),
+            max_outputs=max_outputs_per_sample if max_outputs_per_sample is not None else float("inf"),
+            max_intra_component_perms=max_intra_component_perms if max_intra_component_perms is not None else float("inf"),
+            max_intra_predicate_perms=max_intra_predicate_perms if max_intra_predicate_perms is not None else float("inf"),
             seed=seed + idx,
             permute_directives_too=permute_directives_too,
             correct_answer=correct_answer,
@@ -502,13 +498,14 @@ def _build_permuted_rows(
 
 def build_gsm8k_proper_dataset(
     *,
-    permutations_per_sample: int = 10,
+    permutations_per_sample: int = 2,
     train_size: Optional[int] = None,
     test_size: Optional[int] = None,
     validation_size: Optional[int] = None,
     seed: int = 42,
-    max_component_perms: Optional[int] = None,
-    max_outputs_per_sample: Optional[int] = None,
+    max_intra_component_perms: Optional[int] = 10,
+    max_intra_predicate_perms: Optional[int] = 10,
+    max_outputs_per_sample: Optional[int] = 100,
     permute_directives_too: bool = False,
     shuffle_augmented_train: bool = True,
     workers: int = 10,
@@ -549,7 +546,8 @@ def build_gsm8k_proper_dataset(
         prolog_train,
         ground_truth_by_prompt=ground_truth_by_prompt,
         permutations_per_sample=permutations_per_sample,
-        max_component_perms=max_component_perms,
+        max_intra_component_perms=max_intra_component_perms,
+        max_intra_predicate_perms=max_intra_predicate_perms,
         max_outputs_per_sample=max_outputs_per_sample,
         seed=seed,
         permute_directives_too=permute_directives_too,
@@ -590,7 +588,8 @@ def build_gsm8k_proper_dataset(
         "ratio": _ratio_dir_name(permutations_per_sample),
         "permutations_per_sample": permutations_per_sample,
         "seed": seed,
-        "max_component_perms": max_component_perms,
+        "max_intra_component_perms": max_intra_component_perms,
+        "max_intra_predicate_perms": max_intra_predicate_perms,
         "max_outputs_per_sample": max_outputs_per_sample,
         "permute_directives_too": permute_directives_too,
         "shuffle_augmented_train": shuffle_augmented_train,
@@ -622,13 +621,14 @@ if __name__ == "__main__":
         default=None,
         help="Directory with gsm8k_prolog/ and openai_gsm8k/ (versioned). Default: default version.",
     )
-    parser.add_argument("--permutations-per-sample", type=int, default=10)
+    parser.add_argument("--permutations-per-sample", type=int, default=2)
     parser.add_argument("--train-size", type=int, default=None)
     parser.add_argument("--test-size", type=int, default=None)
     parser.add_argument("--validation-size", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--max-component-perms", type=int, default=None)
-    parser.add_argument("--max-outputs-per-sample", type=int, default=10)
+    parser.add_argument("--max-intra-component-perms", type=int, default=10)
+    parser.add_argument("--max-intra-predicate-perms", type=int, default=10)
+    parser.add_argument("--max-outputs-per-sample", type=int, default=100)
     parser.add_argument("--permute-directives-too", action="store_true")
     parser.add_argument("--no-shuffle-augmented-train", action="store_true")
     parser.add_argument("--workers", type=int, default=10)
@@ -641,7 +641,8 @@ if __name__ == "__main__":
         test_size=args.test_size,
         validation_size=args.validation_size,
         seed=args.seed,
-        max_component_perms=args.max_component_perms,
+        max_intra_component_perms=args.max_intra_component_perms,
+        max_intra_predicate_perms=args.max_intra_predicate_perms,
         max_outputs_per_sample=args.max_outputs_per_sample,
         permute_directives_too=args.permute_directives_too,
         shuffle_augmented_train=not args.no_shuffle_augmented_train,
