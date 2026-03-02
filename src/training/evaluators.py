@@ -1,7 +1,6 @@
 from __future__ import annotations
-import json
 from pathlib import Path
-from typing import Any, Callable, cast
+from typing import Any
 
 from src.prolog.execute import execute_solve
 from transformers import TrainerCallback
@@ -9,17 +8,34 @@ import torch
 
 
 class PrologAccuracyCallback(TrainerCallback):
-    def __init__(self, *, tokenizer, eval_rows, gt_map, out_dir: Path, max_samples: int = 100):
+    def __init__(
+        self,
+        *,
+        tokenizer,
+        eval_rows,
+        gt_map,
+        out_dir: Path,
+        max_samples: int = 100,
+        eval_every_steps: int = 1,
+    ):
+        if eval_every_steps < 1:
+            raise ValueError("eval_every_steps must be >= 1")
+
         self.tokenizer = tokenizer
         self.eval_rows = eval_rows
         self.gt_map = gt_map
         self.out_file = out_dir / "prolog_eval_metrics.jsonl"
         self.max_samples = max_samples
+        self.eval_every_steps = eval_every_steps
         self.history = []
         self.last_result = None
 
     def on_evaluate(self, args, state, control, model=None, metrics=None, **kwargs):
         if model is None:
+            return control
+        if not state.is_world_process_zero:
+            return control
+        if int(state.global_step) % self.eval_every_steps != 0:
             return control
 
         model.eval()
@@ -72,7 +88,6 @@ class PrologAccuracyCallback(TrainerCallback):
         self.last_result = result
         self.history.append(result)
 
-        metrics = kwargs.get("metrics")
         if isinstance(metrics, dict):
             metrics["eval_prolog_exec_ok_rate"] = exec_rate
             metrics["eval_prolog_answer_accuracy"] = acc

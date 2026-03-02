@@ -4,7 +4,7 @@ import json
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, cast
+from typing import Any, Callable, Sequence, cast
 
 from src.training.data import load_training_splits
 
@@ -16,9 +16,10 @@ from transformers import (
     AutoTokenizer,
     DataCollatorForLanguageModeling,
     Trainer,
+    TrainerCallback,
     TrainingArguments,
 )
-from datasets import Dataset
+from datasets import Dataset, DatasetDict
 import torch
 
 TRAINING_RESULTS_DIR = Path(__file__).resolve().parent / "training_results"
@@ -68,6 +69,18 @@ class TrainConfig:
     gradient_accumulation_steps: int = 8
     max_seq_length: int = 1024
     dry_run: bool = False
+
+
+@dataclass(frozen=True)
+class RunContext:
+    cfg: TrainConfig
+    tokenizer: AutoTokenizer
+    raw_dataset: DatasetDict
+
+
+EvaluatorLike = TrainerCallback | Callable[
+    [RunContext], TrainerCallback | Sequence[TrainerCallback]
+]
 
 
 def parse_args() -> TrainConfig:
@@ -145,6 +158,7 @@ def build_trainer(cfg: TrainConfig,
                   tokenizer: AutoTokenizer,
                   train_ds: Dataset,
                   eval_ds: Dataset,
+                  callbacks: Sequence[TrainerCallback] | None = None,
                   eval_strategy: str = "steps",
                   eval_steps: int = 10,
                   save_steps: int = 10,
@@ -184,10 +198,54 @@ def build_trainer(cfg: TrainConfig,
         eval_dataset=eval_tok,
         processing_class=cast(Any, tokenizer),
         data_collator=collator,
+        callbacks=list(callbacks) if callbacks else None,
     )
 
 
-def run(cfg: TrainConfig) -> None:
+def _resolve_evaluator_callbacks(
+    evaluators: Sequence[EvaluatorLike] | None,
+    *,
+    context: RunContext,
+) -> list[TrainerCallback]:
+    if not evaluators:
+        return []
+
+    callbacks: list[TrainerCallback] = []
+    for evaluator in evaluators:
+        if isinstance(evaluator, TrainerCallback):
+            callbacks.append(evaluator)
+            continue
+
+        produced = evaluator(context)
+        if isinstance(produced, TrainerCallback):
+            callbacks.append(produced)
+            continue
+        if produced is None:
+            continue
+
+        for cb in produced:
+            if not isinstance(cb, TrainerCallback):
+                raise TypeError(
+                    "Evaluator callable must return TrainerCallback or "
+                    "a sequence of TrainerCallback instances."
+                )
+            callbacks.append(cb)
+    return callbacks
+
+
+def run(
+    cfg: TrainConfig,
+    *,
+    evaluators: Sequence[EvaluatorLike] | None = None,
+) -> None:
+    """
+    Execute SFT training with optional pluggable evaluator callbacks.
+
+    `evaluators` accepts either:
+    - a `TrainerCallback` instance
+    - a factory callable taking `RunContext` and returning one or many callbacks
+    """
+    raw_ds = load_prepared_dataset(cfg.dataset_dir)
     train_ds, eval_ds = load_training_splits(
         cfg.dataset_dir,
         max_train_samples=cfg.max_train_samples,
@@ -203,16 +261,30 @@ def run(cfg: TrainConfig) -> None:
 
     tokenizer = build_tokenizer(cfg)
     model = cast(AutoModelForCausalLM, build_model(cfg))
+    context = RunContext(cfg=cfg, tokenizer=tokenizer, raw_dataset=raw_ds)
+    callbacks = _resolve_evaluator_callbacks(evaluators, context=context)
     trainer = build_trainer(
         cfg,
         model=model,
         tokenizer=tokenizer,
         train_ds=train_ds,
         eval_ds=eval_ds,
+        callbacks=callbacks,
     )
-    
-    #TODO
-    ...
+
+    train_result = trainer.train()
+    trainer.save_model(str(cfg.output_dir))
+    trainer.save_state()
+
+    train_metrics = dict(train_result.metrics)
+    train_metrics["train_samples"] = len(train_ds)
+    trainer.log_metrics("train", train_metrics)
+    trainer.save_metrics("train", train_metrics)
+
+    eval_metrics = trainer.evaluate()
+    eval_metrics["eval_samples"] = len(eval_ds)
+    trainer.log_metrics("eval", eval_metrics)
+    trainer.save_metrics("eval", eval_metrics)
 
 
 def main() -> None:
