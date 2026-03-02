@@ -68,7 +68,7 @@ def _coerce_numeric_text_to_float_str(s: str) -> str | None:
         return None
 
 
-def normalize_answer_for_eval(answer: Any) -> str:
+def normalize_prolog_answer_for_eval(answer: Any) -> str:
     """
     Normalize Prolog answer into a standard float-string representation.
 
@@ -222,7 +222,7 @@ def execute_prolog_string(
                     answers=[parsed],
                     bindings={answer_var: parsed},
                     elapsed_ms=(perf_counter() - started) * 1000,
-                    normalized_answer=normalize_answer_for_eval(parsed),
+                    normalized_answer=normalize_prolog_answer_for_eval(parsed),
                     raw_answer_text=raw,
                     stdout=stdout,
                     stderr=stderr,

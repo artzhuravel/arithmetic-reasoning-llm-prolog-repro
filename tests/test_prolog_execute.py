@@ -111,19 +111,19 @@ def test_syntax_error_classification() -> None:
 
 def test_answer_normalization_for_eval() -> None:
     """Verify standardized float-string normalization."""
-    from src.prolog.execute import normalize_answer_for_eval
+    from src.prolog.execute import normalize_prolog_answer_for_eval
 
     for val in (14, 14.0):
-        s = normalize_answer_for_eval(val)
+        s = normalize_prolog_answer_for_eval(val)
         assert s == "14.0", f"val={val!r} -> {s!r}"
 
-    assert normalize_answer_for_eval(3.5) == "3.5"
-    assert normalize_answer_for_eval("1r2") == "0.5"
-    assert normalize_answer_for_eval("10r3").startswith("3.333333")
-    assert "r" not in normalize_answer_for_eval("10r3")
-    assert normalize_answer_for_eval("'11026'") == "11026.0"
-    assert normalize_answer_for_eval('"11026"') == "11026.0"
-    assert normalize_answer_for_eval(None) == ""
+    assert normalize_prolog_answer_for_eval(3.5) == "3.5"
+    assert normalize_prolog_answer_for_eval("1r2") == "0.5"
+    assert normalize_prolog_answer_for_eval("10r3").startswith("3.333333")
+    assert "r" not in normalize_prolog_answer_for_eval("10r3")
+    assert normalize_prolog_answer_for_eval("'11026'") == "11026.0"
+    assert normalize_prolog_answer_for_eval('"11026"') == "11026.0"
+    assert normalize_prolog_answer_for_eval(None) == ""
 
 
 if __name__ == "__main__":

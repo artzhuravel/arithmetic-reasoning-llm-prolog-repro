@@ -10,7 +10,7 @@ from datasets import Dataset, DatasetDict, load_from_disk
 from tqdm import tqdm
 
 from src.data.prepare_splits import get_default_splits_dir
-from src.prolog.execute import execute_solve, normalize_answer_for_eval
+from src.prolog.execute import execute_solve, normalize_prolog_answer_for_eval
 
 
 GROUND_TRUTH_FILENAME = "ground_truth_by_prompt.json"
@@ -78,7 +78,7 @@ def validate_proper_dataset(
                 {"split": split, "index": idx, "prompt": prompt},
             )
 
-        expected = normalize_answer_for_eval(gt_map[prompt])
+        expected = normalize_prolog_answer_for_eval(gt_map[prompt])
         got = execute_solve(output)
         if not got.ok:
             return (

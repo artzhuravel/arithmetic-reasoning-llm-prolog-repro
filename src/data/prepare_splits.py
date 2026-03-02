@@ -8,7 +8,7 @@ from src.data.hf_loaders import (
     OPENAI_GSM8K_REVISION,
     load_gsm8k_datasets,
 )
-from src.prolog.execute import execute_solve, normalize_answer_for_eval
+from src.prolog.execute import execute_solve, normalize_prolog_answer_for_eval
 
 import argparse
 import json
@@ -104,7 +104,7 @@ def _extract_openai_gsm8k_final_answer(answer_text: str) -> str:
     if m is None:
         raise ValueError("Could not find final GSM8K answer marker ('#### <number>').")
     raw = m.group(1).replace(",", "")
-    return normalize_answer_for_eval(raw)
+    return normalize_prolog_answer_for_eval(raw)
 
 
 def _build_ground_truth_map(

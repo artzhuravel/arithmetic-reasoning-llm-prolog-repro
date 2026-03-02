@@ -13,7 +13,7 @@ import random
 from datasets import Dataset, DatasetDict, concatenate_datasets, load_from_disk
 
 from src.data.prepare_splits import get_default_splits_dir, prepare_splits
-from src.prolog.execute import execute_solve, normalize_answer_for_eval
+from src.prolog.execute import execute_solve, normalize_prolog_answer_for_eval
 
 def _noop_tqdm(iterable: Any, **_: Any) -> Any:
     return iterable
@@ -188,7 +188,7 @@ def get_all_output_variations(
 
     rng = random.Random(seed)
     expected_answer_normalized = (
-        normalize_answer_for_eval(correct_answer) if correct_answer is not None else None
+        normalize_prolog_answer_for_eval(correct_answer) if correct_answer is not None else None
     )
 
     directives, facts, predicates_clauses = get_directives_facts_and_predicates(output)
@@ -282,7 +282,7 @@ def _extract_openai_gsm8k_final_answer(answer_text: str) -> str:
     if m is None:
         raise ValueError("Could not find final GSM8K answer marker ('#### <number>').")
     raw = m.group(1).replace(",", "")
-    return normalize_answer_for_eval(raw)
+    return normalize_prolog_answer_for_eval(raw)
 
 
 def _load_ground_truth_by_prompt(
@@ -351,7 +351,7 @@ def get_gsm8k_prolog_train_correct_answers(
         prompt = str(prolog_train[i]["input"]).strip()
         if prompt not in ground_truth_by_prompt:
             raise ValueError(f"Missing ground-truth answer for train prompt at index {i}.")
-        answers.append(normalize_answer_for_eval(ground_truth_by_prompt[prompt]))
+        answers.append(normalize_prolog_answer_for_eval(ground_truth_by_prompt[prompt]))
     return answers
 
 
