@@ -5,3 +5,31 @@ Independent reproduction of:
   - Paper: https://aclanthology.org/2024.naacl-short.61/
 
 This repository is not affiliated with the paper authors.
+
+## Docker (GPU)
+
+This project includes a CUDA-enabled Docker setup for training on Linux + NVIDIA GPUs.
+
+### 1) Build image
+
+```bash
+docker compose build trainer
+```
+
+### 2) Start container shell
+
+```bash
+docker compose run --rm trainer
+```
+
+### 3) Run training inside container
+
+```bash
+python -m src.training.train_sft \
+  --dataset-name gsm8k_proper \
+  --proper-ratio 1to2 \
+  --output-dir src/training/training_results/run2 \
+  --model-name-or-path mistralai/Mistral-7B-v0.3
+```
+
+If you already have a specific prepared dataset path, use `--dataset-dir` instead of `--dataset-name`.
