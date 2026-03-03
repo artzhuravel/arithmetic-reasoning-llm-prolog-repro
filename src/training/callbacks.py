@@ -1,10 +1,12 @@
 from __future__ import annotations
+import json
 from pathlib import Path
 from typing import Any
 
 from src.prolog.execute import execute_solve
 from transformers import TrainerCallback
 import torch
+import logging
 
 
 class PrologAccuracyCallback(TrainerCallback):
@@ -14,7 +16,7 @@ class PrologAccuracyCallback(TrainerCallback):
         tokenizer,
         eval_rows,
         gt_map,
-        out_dir: Path,
+        out_dir: Path | None = None,
         max_samples: int = 100,
         eval_every_steps: int = 1,
     ):
@@ -24,15 +26,40 @@ class PrologAccuracyCallback(TrainerCallback):
         self.tokenizer = tokenizer
         self.eval_rows = eval_rows
         self.gt_map = gt_map
-        self.out_file = out_dir / "prolog_eval_metrics.jsonl"
         self.max_samples = max_samples
         self.eval_every_steps = eval_every_steps
+        self.out_file = (
+            out_dir / "prolog_eval_metrics.jsonl" if out_dir is not None else None
+        )
         self.history = []
         self.last_result = None
 
-    def on_evaluate(self, args, state, control, model=None, metrics=None, **kwargs):
+    def on_evaluate(self,
+                    args,
+                    state,
+                    control,
+                    model=None,
+                    metrics=None,
+                    **kwargs) -> Any:
+
         if model is None:
+            skipped_result = {
+                "callback": self.__class__.__name__,
+                "step": int(state.global_step),
+                "epoch": float(state.epoch or 0.0),
+                "status": "skipped",
+                "reason": "model_is_none",
+            }
+            self.last_result = skipped_result
+            self.history.append(skipped_result)
+            logging.warning(
+                "[%s] Model is None at step=%d epoch=%.4f; skipping evaluation.",
+                skipped_result["callback"],
+                skipped_result["step"],
+                skipped_result["epoch"],
+            )
             return control
+
         if not state.is_world_process_zero:
             return control
         if int(state.global_step) % self.eval_every_steps != 0:
@@ -78,6 +105,7 @@ class PrologAccuracyCallback(TrainerCallback):
         exec_rate = exec_ok / n if n else 0.0
         
         result = {
+            "callback": self.__class__.__name__,
             "step": int(state.global_step),
             "epoch": float(state.epoch or 0.0),
             "prolog_eval_samples": n,
@@ -91,5 +119,10 @@ class PrologAccuracyCallback(TrainerCallback):
         if isinstance(metrics, dict):
             metrics["eval_prolog_exec_ok_rate"] = exec_rate
             metrics["eval_prolog_answer_accuracy"] = acc
+
+        if self.out_file is not None:
+            self.out_file.parent.mkdir(parents=True, exist_ok=True)
+            with self.out_file.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(result) + "\n")
 
         return control
