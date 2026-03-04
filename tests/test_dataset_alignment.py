@@ -21,11 +21,8 @@ from src.data.hf_loaders import (
 )
 from src.prolog.execute import execute_solve
 
-TESTS_DIR = Path(__file__).resolve().parent
-VALIDATION_RESULTS_DIR = TESTS_DIR / "validation_results"
-
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
+VALIDATION_RESULTS_DIR = REPO_ROOT / "outputs" / "validation"
 DATA_RAW_DIR = REPO_ROOT / "data" / "raw"
 
 
