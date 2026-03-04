@@ -22,8 +22,7 @@ RUN ln -sf /usr/bin/python3 /usr/local/bin/python
 COPY requirements.txt /workspace/requirements.txt
 
 # Install CUDA-enabled PyTorch first, then project dependencies.
-RUN python -m pip install --upgrade pip setuptools wheel && \
-    python -m pip install --index-url https://download.pytorch.org/whl/cu121 torch && \
+RUN python -m pip install --index-url https://download.pytorch.org/whl/cu121 torch && \
     python -m pip install -r /workspace/requirements.txt && \
     python -m pip install bitsandbytes tqdm sentencepiece
 

@@ -4,7 +4,7 @@ import logging
 import os
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol, Sequence, cast
 
@@ -74,6 +74,16 @@ def load_ground_truth_map(dataset_dir: Path) -> dict[str, str]:
 
 
 @dataclass(frozen=True)
+class CustomCallbacksConfig:
+    enabled: bool = True
+    max_samples: int = 100
+    eval_every_steps: int = 50
+    generation_batch_size: int = 6
+    generation_num_beams: int = 4
+    generation_max_new_tokens: int = 256
+
+
+@dataclass(frozen=True)
 class TrainConfig:
     dataset_dir: Path
     model_name_or_path: str
@@ -87,9 +97,9 @@ class TrainConfig:
     per_device_eval_batch_size: int = 2
     gradient_accumulation_steps: int = 8
     max_seq_length: int = 1024
-    enable_custom_callbacks: bool = True
-    custom_callbacks_max_samples: int = 100
-    custom_callbacks_eval_every_steps: int = 50
+    custom_callbacks: CustomCallbacksConfig = field(
+        default_factory=CustomCallbacksConfig
+    )
     torch_dtype: str = "bfloat16"
     device_map: str | None = "auto"
     hf_token: str | None = None
@@ -108,7 +118,7 @@ class RunContext:
 
 @dataclass(frozen=True)
 class LoraStrategyConfig:
-    quantization: str = "8bit"
+    quantization: str = "none"
     r: int = 32
     alpha: int = 64
     dropout: float = 0.05
@@ -311,6 +321,21 @@ def parse_args() -> tuple[TrainConfig, ModelBuildStrategy]:
     parser.add_argument("--custom-callbacks-max-samples", type=int, default=100)
     parser.add_argument("--custom-callbacks-eval-every-steps", type=int, default=50)
     parser.add_argument(
+        "--custom-callbacks-generation-batch-size",
+        type=int,
+        default=6,
+    )
+    parser.add_argument(
+        "--custom-callbacks-generation-num-beams",
+        type=int,
+        default=4,
+    )
+    parser.add_argument(
+        "--custom-callbacks-generation-max-new-tokens",
+        type=int,
+        default=256,
+    )
+    parser.add_argument(
         "--torch-dtype",
         type=str,
         default="bfloat16",
@@ -334,7 +359,7 @@ def parse_args() -> tuple[TrainConfig, ModelBuildStrategy]:
     resolved_quantization = (
         str(args.quantization)
         if args.quantization is not None
-        else ("8bit" if args.training_strategy == "lora" else "none")
+        else "none"
     )
     if args.training_strategy == "lora" and not resolved_lora_targets:
         raise ValueError(
@@ -365,9 +390,14 @@ def parse_args() -> tuple[TrainConfig, ModelBuildStrategy]:
         per_device_eval_batch_size=args.per_device_eval_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         max_seq_length=args.max_seq_length,
-        enable_custom_callbacks=args.enable_custom_callbacks,
-        custom_callbacks_max_samples=args.custom_callbacks_max_samples,
-        custom_callbacks_eval_every_steps=args.custom_callbacks_eval_every_steps,
+        custom_callbacks=CustomCallbacksConfig(
+            enabled=args.enable_custom_callbacks,
+            max_samples=args.custom_callbacks_max_samples,
+            eval_every_steps=args.custom_callbacks_eval_every_steps,
+            generation_batch_size=args.custom_callbacks_generation_batch_size,
+            generation_num_beams=args.custom_callbacks_generation_num_beams,
+            generation_max_new_tokens=args.custom_callbacks_generation_max_new_tokens,
+        ),
         torch_dtype=args.torch_dtype,
         device_map=resolved_device_map,
         hf_token=args.hf_token,
@@ -582,7 +612,7 @@ def _resolve_eval_rows(raw_ds: DatasetDict) -> Dataset:
 
 def _resolve_default_callbacks(context: RunContext) -> list[TrainerCallback]:
     cfg = context.cfg
-    if not cfg.enable_custom_callbacks:
+    if not cfg.custom_callbacks.enabled:
         LOGGER.info("Default custom callbacks disabled by config.")
         return []
     if not _is_prolog_like_dataset(cfg.dataset_dir):
@@ -603,11 +633,15 @@ def _resolve_default_callbacks(context: RunContext) -> list[TrainerCallback]:
     LOGGER.info(
         (
             "Attached default PrologAccuracyCallback "
-            "(max_samples=%d, eval_every_steps=%d, workers=%d)."
+            "(max_samples=%d, eval_every_steps=%d, workers=%d, generation_batch_size=%d, "
+            "generation_num_beams=%d, generation_max_new_tokens=%d)."
         ),
-        cfg.custom_callbacks_max_samples,
-        cfg.custom_callbacks_eval_every_steps,
+        cfg.custom_callbacks.max_samples,
+        cfg.custom_callbacks.eval_every_steps,
         CUSTOM_CALLBACKS_WORKERS,
+        cfg.custom_callbacks.generation_batch_size,
+        cfg.custom_callbacks.generation_num_beams,
+        cfg.custom_callbacks.generation_max_new_tokens,
     )
     return [
         PrologAccuracyCallback(
@@ -615,9 +649,12 @@ def _resolve_default_callbacks(context: RunContext) -> list[TrainerCallback]:
             eval_rows=eval_rows,
             gt_map=gt_map,
             template=template,
-            max_samples=cfg.custom_callbacks_max_samples,
-            eval_every_steps=cfg.custom_callbacks_eval_every_steps,
+            max_samples=cfg.custom_callbacks.max_samples,
+            eval_every_steps=cfg.custom_callbacks.eval_every_steps,
             workers=CUSTOM_CALLBACKS_WORKERS,
+            generation_batch_size=cfg.custom_callbacks.generation_batch_size,
+            generation_num_beams=cfg.custom_callbacks.generation_num_beams,
+            generation_max_new_tokens=cfg.custom_callbacks.generation_max_new_tokens,
         )
     ]
 
