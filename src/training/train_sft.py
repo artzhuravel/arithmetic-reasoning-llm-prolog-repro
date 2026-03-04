@@ -133,9 +133,9 @@ class FullFineTuneStrategy:
         model_kwargs: dict[str, Any] = {"dtype": _resolve_torch_dtype(cfg.torch_dtype)}
         if cfg.device_map is not None:
             model_kwargs["device_map"] = cfg.device_map
+        model_kwargs = _maybe_add_hf_token(cfg, model_kwargs)
         return AutoModelForCausalLM.from_pretrained(
             cfg.model_name_or_path,
-            token=_resolve_hf_token(cfg),
             **model_kwargs,
         )
 
@@ -164,10 +164,10 @@ class LoraFineTuneStrategy:
             model_kwargs["quantization_config"] = quant_config
         if cfg.device_map is not None:
             model_kwargs["device_map"] = cfg.device_map
+        model_kwargs = _maybe_add_hf_token(cfg, model_kwargs)
 
         model = AutoModelForCausalLM.from_pretrained(
             cfg.model_name_or_path,
-            token=_resolve_hf_token(cfg),
             **model_kwargs,
         )
 
@@ -398,10 +398,11 @@ def preview_formatted_examples(train_ds: Any, eval_ds: Any, *, n: int = 1) -> No
 
 
 def build_tokenizer(cfg: TrainConfig) -> Any:
+    tokenizer_kwargs: dict[str, Any] = {"use_fast": True}
+    tokenizer_kwargs = _maybe_add_hf_token(cfg, tokenizer_kwargs)
     tokenizer = AutoTokenizer.from_pretrained(
         cfg.model_name_or_path,
-        use_fast=True,
-        token=_resolve_hf_token(cfg),
+        **tokenizer_kwargs,
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -419,6 +420,13 @@ def _resolve_hf_token(cfg: TrainConfig) -> str | None:
         if value is not None and value.strip():
             return value.strip()
     return None
+
+
+def _maybe_add_hf_token(cfg: TrainConfig, kwargs: dict[str, Any]) -> dict[str, Any]:
+    token = _resolve_hf_token(cfg)
+    if token is not None:
+        kwargs["token"] = token
+    return kwargs
 
 
 def _resolve_torch_dtype(name: str) -> torch.dtype | str:
