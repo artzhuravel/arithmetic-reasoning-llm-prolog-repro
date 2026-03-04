@@ -78,7 +78,7 @@ class CustomCallbacksConfig:
     enabled: bool = True
     max_samples: int = 100
     eval_every_steps: int = 50
-    generation_batch_size: int = 6
+    generation_batch_size: int = 7
     generation_num_beams: int = 4
     generation_max_new_tokens: int = 256
 
