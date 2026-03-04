@@ -137,6 +137,9 @@ class PrologAccuracyCallback(TrainerCallback):
         correct = 0
         batch_size = self.generation_batch_size
         executor: ThreadPoolExecutor | None = None
+        padding_side_original = getattr(self.tokenizer, "padding_side", None)
+        if padding_side_original != "left":
+            self.tokenizer.padding_side = "left"
         if self.workers > 1:
             executor = ThreadPoolExecutor(max_workers=self.workers)
         try:
@@ -247,6 +250,8 @@ class PrologAccuracyCallback(TrainerCallback):
         finally:
             if executor is not None:
                 executor.shutdown(wait=True)
+            if padding_side_original is not None:
+                self.tokenizer.padding_side = padding_side_original
 
         acc = correct / n if n else 0.0
         exec_rate = exec_ok / n if n else 0.0
