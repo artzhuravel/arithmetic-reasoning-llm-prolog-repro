@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json
 import logging
+import os
 
 import argparse
 from dataclasses import dataclass
@@ -91,7 +92,11 @@ class TrainConfig:
     custom_callbacks_eval_every_steps: int = 50
     torch_dtype: str = "bfloat16"
     device_map: str | None = "auto"
+    hf_token: str | None = None
     dry_run: bool = False
+
+
+CUSTOM_CALLBACKS_WORKERS = 10
 
 
 @dataclass(frozen=True)
@@ -125,13 +130,12 @@ class FullFineTuneStrategy:
                 "Full fine-tuning strategy currently supports only --quantization none."
             )
 
-        model_kwargs: dict[str, Any] = {
-            "torch_dtype": _resolve_torch_dtype(cfg.torch_dtype),
-        }
+        model_kwargs: dict[str, Any] = {"dtype": _resolve_torch_dtype(cfg.torch_dtype)}
         if cfg.device_map is not None:
             model_kwargs["device_map"] = cfg.device_map
         return AutoModelForCausalLM.from_pretrained(
             cfg.model_name_or_path,
+            token=_resolve_hf_token(cfg),
             **model_kwargs,
         )
 
@@ -155,9 +159,7 @@ class LoraFineTuneStrategy:
             quantization=self.lora.quantization,
             torch_dtype=cfg.torch_dtype,
         )
-        model_kwargs: dict[str, Any] = {
-            "torch_dtype": _resolve_torch_dtype(cfg.torch_dtype),
-        }
+        model_kwargs: dict[str, Any] = {"dtype": _resolve_torch_dtype(cfg.torch_dtype)}
         if quant_config is not None:
             model_kwargs["quantization_config"] = quant_config
         if cfg.device_map is not None:
@@ -165,6 +167,7 @@ class LoraFineTuneStrategy:
 
         model = AutoModelForCausalLM.from_pretrained(
             cfg.model_name_or_path,
+            token=_resolve_hf_token(cfg),
             **model_kwargs,
         )
 
@@ -252,6 +255,15 @@ def parse_args() -> tuple[TrainConfig, ModelBuildStrategy]:
     )
     parser.add_argument("--output-dir", type=Path, default=TRAINING_RESULTS_DIR)
     parser.add_argument("--model-name-or-path", type=str, required=True)
+    parser.add_argument(
+        "--hf-token",
+        type=str,
+        default=None,
+        help=(
+            "Optional Hugging Face token. Prefer setting HF_TOKEN in the environment "
+            "to avoid exposing secrets in shell history."
+        ),
+    )
 
     parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--max-eval-samples", type=int, default=None)
@@ -358,6 +370,7 @@ def parse_args() -> tuple[TrainConfig, ModelBuildStrategy]:
         custom_callbacks_eval_every_steps=args.custom_callbacks_eval_every_steps,
         torch_dtype=args.torch_dtype,
         device_map=resolved_device_map,
+        hf_token=args.hf_token,
         dry_run=args.dry_run,
     )
     strategy: ModelBuildStrategy
@@ -385,13 +398,27 @@ def preview_formatted_examples(train_ds: Any, eval_ds: Any, *, n: int = 1) -> No
 
 
 def build_tokenizer(cfg: TrainConfig) -> Any:
-    
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model_name_or_path, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        cfg.model_name_or_path,
+        use_fast=True,
+        token=_resolve_hf_token(cfg),
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
     
     return tokenizer
+
+
+def _resolve_hf_token(cfg: TrainConfig) -> str | None:
+    if cfg.hf_token is not None and cfg.hf_token.strip():
+        return cfg.hf_token.strip()
+
+    for env_name in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACEHUB_API_TOKEN"):
+        value = os.getenv(env_name)
+        if value is not None and value.strip():
+            return value.strip()
+    return None
 
 
 def _resolve_torch_dtype(name: str) -> torch.dtype | str:
@@ -563,9 +590,13 @@ def _resolve_default_callbacks(context: RunContext) -> list[TrainerCallback]:
         return []
 
     LOGGER.info(
-        "Attached default PrologAccuracyCallback (max_samples=%d, eval_every_steps=%d).",
+        (
+            "Attached default PrologAccuracyCallback "
+            "(max_samples=%d, eval_every_steps=%d, workers=%d)."
+        ),
         cfg.custom_callbacks_max_samples,
         cfg.custom_callbacks_eval_every_steps,
+        CUSTOM_CALLBACKS_WORKERS,
     )
     return [
         PrologAccuracyCallback(
@@ -575,6 +606,7 @@ def _resolve_default_callbacks(context: RunContext) -> list[TrainerCallback]:
             template=template,
             max_samples=cfg.custom_callbacks_max_samples,
             eval_every_steps=cfg.custom_callbacks_eval_every_steps,
+            workers=CUSTOM_CALLBACKS_WORKERS,
         )
     ]
 
@@ -605,6 +637,12 @@ def run(
         return
 
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
+    if _resolve_hf_token(cfg) is None:
+        LOGGER.warning(
+            "HF token not detected. Downloads will be unauthenticated and may be rate-limited."
+        )
+    else:
+        LOGGER.info("HF token detected. Using authenticated Hugging Face Hub requests.")
 
     tokenizer = build_tokenizer(cfg)
     model = cast(AutoModelForCausalLM, strategy.build_model(cfg))
