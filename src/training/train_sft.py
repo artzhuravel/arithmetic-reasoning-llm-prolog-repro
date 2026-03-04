@@ -477,6 +477,7 @@ def build_trainer(cfg: TrainConfig,
                   ) -> Trainer:
     
     tokenize = cast(Callable[..., Any], tokenizer)
+    logging_strategy = "steps" if eval_strategy == "steps" else "epoch"
 
     train_tok = train_ds.map(
         lambda x: tokenize(x["text"], truncation=True, max_length=cfg.max_seq_length),
@@ -493,6 +494,8 @@ def build_trainer(cfg: TrainConfig,
         output_dir=str(cfg.output_dir),
         eval_strategy=eval_strategy,
         eval_steps=eval_steps,
+        logging_strategy=logging_strategy,
+        logging_steps=eval_steps,
         learning_rate=cfg.learning_rate,
         per_device_train_batch_size=cfg.per_device_train_batch_size,
         per_device_eval_batch_size=cfg.per_device_eval_batch_size,
