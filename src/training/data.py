@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from pathlib import Path
-from typing import Any, Optional, cast
+from typing import Any, Mapping, Optional, cast
 
 from datasets import Dataset, DatasetDict, load_from_disk
 
 _OPENAI_GSM8K_DEFAULT_INSTRUCTION = "Please solve the given math problem."
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -112,6 +114,70 @@ def _infer_template_from_dataset_dir(dataset_dir: Path) -> Optional[PromptTempla
     return None
 
 
+def _resolve_template_from_columns(columns: set[str]) -> PromptTemplate:
+    has_prolog_schema = {"instruction", "input", "output"}.issubset(columns)
+    has_openai_schema = {"question", "answer"}.issubset(columns)
+    if has_prolog_schema:
+        return PROLOG_PROMPT_TEMPLATE
+    if has_openai_schema:
+        return OPENAI_GSM8K_PROMPT_TEMPLATE
+    raise ValueError(
+        "Unsupported split schema. Expected either columns "
+        "{instruction,input,output} or {question,answer}."
+    )
+
+
+def resolve_prompt_template(dataset_dir: Path, split: Dataset) -> PromptTemplate:
+    """
+    Resolve prompt template using the same policy as training text formatting.
+    """
+    inferred = _infer_template_from_dataset_dir(dataset_dir)
+    if inferred is not None:
+        return inferred
+    return _resolve_template_from_columns(set(split.column_names))
+
+
+def _extract_prompt_fields(row: Mapping[str, Any]) -> tuple[str, str, str]:
+    if {"instruction", "input", "output"}.issubset(row):
+        instruction = str(row["instruction"]).strip()
+        user_input = str(row["input"]).strip()
+        output = str(row["output"]).rstrip()
+        return instruction, user_input, output
+    if {"question", "answer"}.issubset(row):
+        instruction = str(
+            row.get("instruction", _OPENAI_GSM8K_DEFAULT_INSTRUCTION)
+        ).strip()
+        user_input = str(row["question"]).strip()
+        output = str(row["answer"]).rstrip()
+        return instruction, user_input, output
+    raise ValueError(
+        "Unsupported row schema. Expected either "
+        "{instruction,input,output} or {question,answer}."
+    )
+
+
+def build_prompt_text(
+    row: Mapping[str, Any],
+    *,
+    template: PromptTemplate,
+    include_output: bool = True,
+) -> str:
+    """
+    Build text with the shared template used for both SFT formatting and eval prompts.
+    """
+    instruction, user_input, output = _extract_prompt_fields(row)
+    prefix = (
+        f"{template.instruction_header}\n"
+        f"{instruction}\n\n"
+        f"{template.input_header}\n"
+        f"{user_input}\n\n"
+        f"{template.output_header}\n"
+    )
+    if include_output:
+        return prefix + output
+    return prefix
+
+
 def format_record_for_sft(
     row: dict[str, Any],
     *,
@@ -122,32 +188,7 @@ def format_record_for_sft(
     - Prolog-style rows: instruction/input/output
     - OpenAI GSM8K rows: question/answer (with a default instruction)
     """
-    
-    if {"instruction", "input", "output"}.issubset(row):
-        instruction = str(row["instruction"]).strip()
-        user_input = str(row["input"]).strip()
-        output = str(row["output"]).rstrip()
-    elif {"question", "answer"}.issubset(row):
-        instruction = str(
-            row.get("instruction", _OPENAI_GSM8K_DEFAULT_INSTRUCTION)
-        ).strip()
-        user_input = str(row["question"]).strip()
-        output = str(row["answer"]).rstrip()
-    else:
-        raise ValueError(
-            "Unsupported row schema. Expected either "
-            "{instruction,input,output} or {question,answer}."
-        )
-
-    text = (
-        f"{template.instruction_header}\n"
-        f"{instruction}\n\n"
-        f"{template.input_header}\n"
-        f"{user_input}\n\n"
-        f"{template.output_header}\n"
-        f"{output}"
-    )
-    return {"text": text}
+    return {"text": build_prompt_text(row, template=template, include_output=True)}
 
 
 def to_text_dataset(
@@ -159,21 +200,13 @@ def to_text_dataset(
     Convert split rows into a plain text field consumed by SFT.
     """
     columns = set(split.column_names)
-    has_prolog_schema = {"instruction", "input", "output"}.issubset(columns)
-    has_openai_schema = {"question", "answer"}.issubset(columns)
-    if not has_prolog_schema and not has_openai_schema:
-        raise ValueError(
-            "Unsupported split schema. Expected either columns "
-            "{instruction,input,output} or {question,answer}."
-        )
+    _resolve_template_from_columns(columns)
 
     resolved_template: PromptTemplate
     if template is not None:
         resolved_template = template
-    elif has_prolog_schema:
-        resolved_template = PROLOG_PROMPT_TEMPLATE
     else:
-        resolved_template = OPENAI_GSM8K_PROMPT_TEMPLATE
+        resolved_template = _resolve_template_from_columns(columns)
 
     return split.map(
         lambda row: format_record_for_sft(row, template=resolved_template),
@@ -193,19 +226,27 @@ def load_training_splits(
     """
     ds = load_prepared_dataset(dataset_dir)
     
-    if "train" in ds:
-        resolved_train_split = "train"
-    else:
+    if "train" not in ds:
+        available = ", ".join(str(k) for k in ds.keys())
         raise KeyError(
-            "Could not infer train split. Ensure dataset has a 'train' split."
+            "Could not infer train split. Strict policy requires a 'train' split. "
+            f"Available splits: [{available}]"
         )
-    
-    if "val" in ds:
-        resolved_eval_split = "val"
-    else:
+    resolved_train_split = "train"
+
+    if "val" not in ds:
+        available = ", ".join(str(k) for k in ds.keys())
         raise KeyError(
-            "Could not infer eval split. Ensure dataset a 'val' split."
+            "Could not infer eval split. Strict policy requires a 'val' split. "
+            f"Available splits: [{available}]"
         )
+    resolved_eval_split = "val"
+
+    LOGGER.info(
+        "Strict split policy active: using train='%s' and eval='%s'.",
+        resolved_train_split,
+        resolved_eval_split,
+    )
 
     train_ds = cast(Dataset, ds[resolved_train_split])
     eval_ds = cast(Dataset, ds[resolved_eval_split])
@@ -215,7 +256,14 @@ def load_training_splits(
     if max_eval_samples is not None:
         eval_ds = eval_ds.select(range(min(max_eval_samples, len(eval_ds))))
 
-    resolved_template = _infer_template_from_dataset_dir(dataset_dir)
+    resolved_template = resolve_prompt_template(dataset_dir, train_ds)
+    LOGGER.info(
+        "Resolved prompt template for dataset '%s': instruction='%s', input='%s', output='%s'.",
+        dataset_dir,
+        resolved_template.instruction_header,
+        resolved_template.input_header,
+        resolved_template.output_header,
+    )
 
     train_text = to_text_dataset(train_ds, template=resolved_template)
     eval_text = to_text_dataset(eval_ds, template=resolved_template)

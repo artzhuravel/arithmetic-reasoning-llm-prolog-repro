@@ -28,7 +28,7 @@ docker compose run --rm trainer
 python -m src.training.train_sft \
   --dataset-name gsm8k_proper \
   --proper-ratio 1to2 \
-  --output-dir src/training/training_results/run2 \
+  --output-dir outputs/training/run2 \
   --model-name-or-path mistralai/Mistral-7B-v0.3
 ```
 

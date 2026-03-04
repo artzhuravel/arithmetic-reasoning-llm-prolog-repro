@@ -1,15 +1,20 @@
 from __future__ import annotations
 import json
+import logging
+import os
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Sequence, cast
+from typing import Any, Callable, Protocol, Sequence, cast
 
-from src.training.data import load_training_splits
-
-from src.training.data import load_prepared_dataset
+from src.training.data import (
+    load_prepared_dataset,
+    load_training_splits,
+    resolve_prompt_template,
+)
 from src.data.prepare_splits import get_default_splits_dir
+from src.training.callbacks import PrologAccuracyCallback
 from src.prolog.execute import normalize_prolog_answer_for_eval
 
 from transformers import (
@@ -24,14 +29,21 @@ from transformers import (
 from datasets import Dataset, DatasetDict
 import torch
 try:
-    from peft import LoraConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
+    from peft import (
+        LoraConfig as PeftLoraConfig,
+        TaskType,
+        get_peft_model,
+        prepare_model_for_kbit_training,
+    )
 except ImportError:
-    LoraConfig = None
+    PeftLoraConfig = None
     TaskType = None
     get_peft_model = None
     prepare_model_for_kbit_training = None
 
-TRAINING_RESULTS_DIR = Path(__file__).resolve().parent / "training_results"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+TRAINING_RESULTS_DIR = REPO_ROOT / "outputs" / "training"
+LOGGER = logging.getLogger(__name__)
 
 def load_ground_truth_map(dataset_dir: Path) -> dict[str, str]:
     """
@@ -62,12 +74,20 @@ def load_ground_truth_map(dataset_dir: Path) -> dict[str, str]:
 
 
 @dataclass(frozen=True)
+class CustomCallbacksConfig:
+    enabled: bool = True
+    max_samples: int = 100
+    eval_every_steps: int = 50
+    generation_batch_size: int = 7
+    generation_num_beams: int = 4
+    generation_max_new_tokens: int = 256
+
+
+@dataclass(frozen=True)
 class TrainConfig:
     dataset_dir: Path
     model_name_or_path: str
     output_dir: Path = TRAINING_RESULTS_DIR
-    train_split: str | None = None
-    eval_split: str | None = None
     max_train_samples: int | None = None
     max_eval_samples: int | None = None
     seed: int = 42
@@ -77,15 +97,16 @@ class TrainConfig:
     per_device_eval_batch_size: int = 2
     gradient_accumulation_steps: int = 8
     max_seq_length: int = 1024
-    quantization: str = "8bit"
-    use_lora: bool = True
-    lora_r: int = 32
-    lora_alpha: int = 64
-    lora_dropout: float = 0.05
-    lora_target_modules: tuple[str, ...] = ("q_proj", "v_proj")
+    custom_callbacks: CustomCallbacksConfig = field(
+        default_factory=CustomCallbacksConfig
+    )
     torch_dtype: str = "bfloat16"
     device_map: str | None = "auto"
+    hf_token: str | None = None
     dry_run: bool = False
+
+
+CUSTOM_CALLBACKS_WORKERS = 10
 
 
 @dataclass(frozen=True)
@@ -93,6 +114,88 @@ class RunContext:
     cfg: TrainConfig
     tokenizer: AutoTokenizer
     raw_dataset: DatasetDict
+
+
+@dataclass(frozen=True)
+class LoraStrategyConfig:
+    quantization: str = "none"
+    r: int = 32
+    alpha: int = 64
+    dropout: float = 0.05
+    target_modules: tuple[str, ...] = ("q_proj", "v_proj")
+
+
+class ModelBuildStrategy(Protocol):
+    def build_model(self, cfg: TrainConfig) -> Any:
+        ...
+
+
+@dataclass(frozen=True)
+class FullFineTuneStrategy:
+    quantization: str = "none"
+
+    def build_model(self, cfg: TrainConfig) -> Any:
+        if self.quantization != "none":
+            raise ValueError(
+                "Full fine-tuning strategy currently supports only --quantization none."
+            )
+
+        model_kwargs: dict[str, Any] = {"dtype": _resolve_torch_dtype(cfg.torch_dtype)}
+        if cfg.device_map is not None:
+            model_kwargs["device_map"] = cfg.device_map
+        model_kwargs = _maybe_add_hf_token(cfg, model_kwargs)
+        return AutoModelForCausalLM.from_pretrained(
+            cfg.model_name_or_path,
+            **model_kwargs,
+        )
+
+
+@dataclass(frozen=True)
+class LoraFineTuneStrategy:
+    lora: LoraStrategyConfig
+
+    def build_model(self, cfg: TrainConfig) -> Any:
+        if (
+            PeftLoraConfig is None
+            or TaskType is None
+            or get_peft_model is None
+            or prepare_model_for_kbit_training is None
+        ):
+            raise ImportError(
+                "PEFT is required for LoRA. Install with: pip install peft"
+            )
+
+        quant_config = _build_quantization_config(
+            quantization=self.lora.quantization,
+            torch_dtype=cfg.torch_dtype,
+        )
+        model_kwargs: dict[str, Any] = {"dtype": _resolve_torch_dtype(cfg.torch_dtype)}
+        if quant_config is not None:
+            model_kwargs["quantization_config"] = quant_config
+        if cfg.device_map is not None:
+            model_kwargs["device_map"] = cfg.device_map
+        model_kwargs = _maybe_add_hf_token(cfg, model_kwargs)
+
+        model = AutoModelForCausalLM.from_pretrained(
+            cfg.model_name_or_path,
+            **model_kwargs,
+        )
+
+        if quant_config is not None:
+            model = cast(Callable[..., Any], prepare_model_for_kbit_training)(model)
+
+        lora_config = cast(Any, PeftLoraConfig)(
+            task_type=TaskType.CAUSAL_LM,
+            r=self.lora.r,
+            lora_alpha=self.lora.alpha,
+            lora_dropout=self.lora.dropout,
+            bias="none",
+            target_modules=list(self.lora.target_modules),
+        )
+        model = cast(Callable[..., Any], get_peft_model)(model, lora_config)
+        if hasattr(model, "print_trainable_parameters"):
+            model.print_trainable_parameters()
+        return model
 
 
 CallbackLike = TrainerCallback | Callable[
@@ -131,7 +234,7 @@ def _resolve_dataset_dir(
     return base_dir / dataset_name
 
 
-def parse_args() -> TrainConfig:
+def parse_args() -> tuple[TrainConfig, ModelBuildStrategy]:
     parser = argparse.ArgumentParser(
         description="SFT scaffold for PROPER/GSM8K-Prolog data."
     )
@@ -160,11 +263,18 @@ def parse_args() -> TrainConfig:
         default="1to2",
         help='Used with --dataset-name gsm8k_proper. Accepts "1to2" or "ratio_1to2".',
     )
-    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, default=TRAINING_RESULTS_DIR)
     parser.add_argument("--model-name-or-path", type=str, required=True)
+    parser.add_argument(
+        "--hf-token",
+        type=str,
+        default=None,
+        help=(
+            "Optional Hugging Face token. Prefer setting HF_TOKEN in the environment "
+            "to avoid exposing secrets in shell history."
+        ),
+    )
 
-    parser.add_argument("--train-split", type=str, default=None)
-    parser.add_argument("--eval-split", type=str, default=None)
     parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--max-eval-samples", type=int, default=None)
 
@@ -176,14 +286,18 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
     parser.add_argument("--max-seq-length", type=int, default=1024)
     parser.add_argument(
+        "--training-strategy",
+        type=str,
+        default="lora",
+        choices=("lora", "full"),
+        help='Training pipeline type: "lora" (default) or "full" fine-tuning.',
+    )
+    parser.add_argument(
         "--quantization",
         type=str,
-        default="8bit",
+        default=None,
         choices=("none", "8bit", "4bit"),
     )
-    parser.add_argument("--use-lora", dest="use_lora", action="store_true")
-    parser.add_argument("--no-lora", dest="use_lora", action="store_false")
-    parser.set_defaults(use_lora=True)
     parser.add_argument("--lora-r", type=int, default=32)
     parser.add_argument("--lora-alpha", type=int, default=64)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
@@ -192,6 +306,34 @@ def parse_args() -> TrainConfig:
         type=str,
         default="q_proj,v_proj",
         help='Comma-separated module names, e.g. "q_proj,v_proj".',
+    )
+    parser.add_argument(
+        "--enable-custom-callbacks",
+        dest="enable_custom_callbacks",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--disable-custom-callbacks",
+        dest="enable_custom_callbacks",
+        action="store_false",
+    )
+    parser.set_defaults(enable_custom_callbacks=True)
+    parser.add_argument("--custom-callbacks-max-samples", type=int, default=100)
+    parser.add_argument("--custom-callbacks-eval-every-steps", type=int, default=50)
+    parser.add_argument(
+        "--custom-callbacks-generation-batch-size",
+        type=int,
+        default=6,
+    )
+    parser.add_argument(
+        "--custom-callbacks-generation-num-beams",
+        type=int,
+        default=4,
+    )
+    parser.add_argument(
+        "--custom-callbacks-generation-max-new-tokens",
+        type=int,
+        default=256,
     )
     parser.add_argument(
         "--torch-dtype",
@@ -214,8 +356,19 @@ def parse_args() -> TrainConfig:
     resolved_lora_targets = tuple(
         part.strip() for part in str(args.lora_target_modules).split(",") if part.strip()
     )
-    if args.use_lora and not resolved_lora_targets:
-        raise ValueError("When --use-lora is set, --lora-target-modules must not be empty.")
+    resolved_quantization = (
+        str(args.quantization)
+        if args.quantization is not None
+        else "none"
+    )
+    if args.training_strategy == "lora" and not resolved_lora_targets:
+        raise ValueError(
+            'When "--training-strategy lora" is used, --lora-target-modules must not be empty.'
+        )
+    if args.training_strategy == "full" and resolved_quantization != "none":
+        raise ValueError(
+            'Full fine-tuning currently requires "--quantization none".'
+        )
 
     resolved_dataset_dir = _resolve_dataset_dir(
         dataset_dir=args.dataset_dir,
@@ -224,12 +377,10 @@ def parse_args() -> TrainConfig:
         proper_ratio=args.proper_ratio,
     )
 
-    return TrainConfig(
+    cfg = TrainConfig(
         dataset_dir=resolved_dataset_dir,
         output_dir=args.output_dir,
         model_name_or_path=args.model_name_or_path,
-        train_split=args.train_split,
-        eval_split=args.eval_split,
         max_train_samples=args.max_train_samples,
         max_eval_samples=args.max_eval_samples,
         seed=args.seed,
@@ -239,16 +390,33 @@ def parse_args() -> TrainConfig:
         per_device_eval_batch_size=args.per_device_eval_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         max_seq_length=args.max_seq_length,
-        quantization=args.quantization,
-        use_lora=args.use_lora,
-        lora_r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        lora_target_modules=resolved_lora_targets,
+        custom_callbacks=CustomCallbacksConfig(
+            enabled=args.enable_custom_callbacks,
+            max_samples=args.custom_callbacks_max_samples,
+            eval_every_steps=args.custom_callbacks_eval_every_steps,
+            generation_batch_size=args.custom_callbacks_generation_batch_size,
+            generation_num_beams=args.custom_callbacks_generation_num_beams,
+            generation_max_new_tokens=args.custom_callbacks_generation_max_new_tokens,
+        ),
         torch_dtype=args.torch_dtype,
         device_map=resolved_device_map,
+        hf_token=args.hf_token,
         dry_run=args.dry_run,
     )
+    strategy: ModelBuildStrategy
+    if args.training_strategy == "lora":
+        strategy = LoraFineTuneStrategy(
+            lora=LoraStrategyConfig(
+                quantization=resolved_quantization,
+                r=args.lora_r,
+                alpha=args.lora_alpha,
+                dropout=args.lora_dropout,
+                target_modules=resolved_lora_targets,
+            )
+        )
+    else:
+        strategy = FullFineTuneStrategy(quantization=resolved_quantization)
+    return cfg, strategy
 
 
 def preview_formatted_examples(train_ds: Any, eval_ds: Any, *, n: int = 1) -> None:
@@ -260,13 +428,35 @@ def preview_formatted_examples(train_ds: Any, eval_ds: Any, *, n: int = 1) -> No
 
 
 def build_tokenizer(cfg: TrainConfig) -> Any:
-    
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model_name_or_path, use_fast=True)
+    tokenizer_kwargs: dict[str, Any] = {"use_fast": True}
+    tokenizer_kwargs = _maybe_add_hf_token(cfg, tokenizer_kwargs)
+    tokenizer = AutoTokenizer.from_pretrained(
+        cfg.model_name_or_path,
+        **tokenizer_kwargs,
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
     
     return tokenizer
+
+
+def _resolve_hf_token(cfg: TrainConfig) -> str | None:
+    if cfg.hf_token is not None and cfg.hf_token.strip():
+        return cfg.hf_token.strip()
+
+    for env_name in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACEHUB_API_TOKEN"):
+        value = os.getenv(env_name)
+        if value is not None and value.strip():
+            return value.strip()
+    return None
+
+
+def _maybe_add_hf_token(cfg: TrainConfig, kwargs: dict[str, Any]) -> dict[str, Any]:
+    token = _resolve_hf_token(cfg)
+    if token is not None:
+        kwargs["token"] = token
+    return kwargs
 
 
 def _resolve_torch_dtype(name: str) -> torch.dtype | str:
@@ -283,14 +473,18 @@ def _resolve_torch_dtype(name: str) -> torch.dtype | str:
     )
 
 
-def _build_quantization_config(cfg: TrainConfig) -> BitsAndBytesConfig | None:
-    if cfg.quantization == "none":
+def _build_quantization_config(
+    *,
+    quantization: str,
+    torch_dtype: str,
+) -> BitsAndBytesConfig | None:
+    if quantization == "none":
         return None
-    if cfg.quantization == "8bit":
+    if quantization == "8bit":
         return BitsAndBytesConfig(load_in_8bit=True)
-    if cfg.quantization == "4bit":
+    if quantization == "4bit":
         compute_dtype = (
-            torch.bfloat16 if cfg.torch_dtype == "bfloat16" else torch.float16
+            torch.bfloat16 if torch_dtype == "bfloat16" else torch.float16
         )
         return BitsAndBytesConfig(
             load_in_4bit=True,
@@ -299,59 +493,8 @@ def _build_quantization_config(cfg: TrainConfig) -> BitsAndBytesConfig | None:
             bnb_4bit_compute_dtype=compute_dtype,
         )
     raise ValueError(
-        f"Unsupported quantization '{cfg.quantization}'. Use one of: none, 8bit, 4bit."
+        f"Unsupported quantization '{quantization}'. Use one of: none, 8bit, 4bit."
     )
-
-
-def build_model(cfg: TrainConfig):
-    if cfg.quantization != "none" and not cfg.use_lora:
-        raise ValueError(
-            "Quantized training in this script requires LoRA. "
-            "Set --use-lora or use --quantization none."
-        )
-
-    if (cfg.use_lora or cfg.quantization != "none") and (
-        LoraConfig is None
-        or TaskType is None
-        or get_peft_model is None
-        or prepare_model_for_kbit_training is None
-    ):
-        raise ImportError(
-            "PEFT is required for LoRA. Install with: pip install peft"
-        )
-
-    quant_config = _build_quantization_config(cfg)
-    model_kwargs: dict[str, Any] = {
-        "torch_dtype": _resolve_torch_dtype(cfg.torch_dtype),
-    }
-    if quant_config is not None:
-        model_kwargs["quantization_config"] = quant_config
-    if cfg.device_map is not None:
-        model_kwargs["device_map"] = cfg.device_map
-
-    model = AutoModelForCausalLM.from_pretrained(
-        cfg.model_name_or_path,
-        **model_kwargs,
-    )
-
-    if quant_config is not None:
-        # Required by PEFT for k-bit training preparation.
-        model = cast(Callable[..., Any], prepare_model_for_kbit_training)(model)
-
-    if cfg.use_lora:
-        assert LoraConfig is not None and TaskType is not None and get_peft_model is not None
-        lora_config = cast(Any, LoraConfig)(
-            task_type=TaskType.CAUSAL_LM,
-            r=cfg.lora_r,
-            lora_alpha=cfg.lora_alpha,
-            lora_dropout=cfg.lora_dropout,
-            bias="none",
-            target_modules=list(cfg.lora_target_modules),
-        )
-        model = cast(Callable[..., Any], get_peft_model)(model, lora_config)
-        if hasattr(model, "print_trainable_parameters"):
-            model.print_trainable_parameters()
-    return model
 
 
 def build_trainer(cfg: TrainConfig,
@@ -362,11 +505,17 @@ def build_trainer(cfg: TrainConfig,
                   eval_ds: Dataset,
                   callbacks: Sequence[TrainerCallback] | None = None,
                   eval_strategy: str = "steps",
-                  eval_steps: int = 10,
-                  save_steps: int = 10,
+                  eval_steps: int = 20,
+                  save_steps: int = 200,
+                  save_strategy: str = "steps",
+                  save_total_limit: int = 2,
+                  load_best_model_at_end: bool = True,
+                  metric_for_best_model: str = "eval_loss",
+                  greater_is_better: bool = False,
                   ) -> Trainer:
     
     tokenize = cast(Callable[..., Any], tokenizer)
+    logging_strategy = "steps" if eval_strategy == "steps" else "epoch"
 
     train_tok = train_ds.map(
         lambda x: tokenize(x["text"], truncation=True, max_length=cfg.max_seq_length),
@@ -383,12 +532,19 @@ def build_trainer(cfg: TrainConfig,
         output_dir=str(cfg.output_dir),
         eval_strategy=eval_strategy,
         eval_steps=eval_steps,
+        logging_strategy=logging_strategy,
+        logging_steps=eval_steps,
         learning_rate=cfg.learning_rate,
         per_device_train_batch_size=cfg.per_device_train_batch_size,
         per_device_eval_batch_size=cfg.per_device_eval_batch_size,
         gradient_accumulation_steps=cfg.gradient_accumulation_steps,
         num_train_epochs=cfg.num_train_epochs,
+        save_strategy=save_strategy,
         save_steps=save_steps,
+        save_total_limit=save_total_limit,
+        load_best_model_at_end=load_best_model_at_end,
+        metric_for_best_model=metric_for_best_model,
+        greater_is_better=greater_is_better,
     )
 
     collator = DataCollatorForLanguageModeling(tokenizer=cast(Any, tokenizer), mlm=False)
@@ -435,9 +591,78 @@ def _resolve_callbacks(
     return callbacks
 
 
+def _is_prolog_like_dataset(dataset_dir: Path) -> bool:
+    for component in dataset_dir.parts:
+        name = component.lower()
+        if "gsm8k_prolog" in name or "gsm8k_proper" in name:
+            return True
+    return False
+
+
+def _resolve_eval_rows(raw_ds: DatasetDict) -> Dataset:
+    if "val" in raw_ds:
+        LOGGER.info("Strict split policy active for callback rows: using eval split 'val'.")
+        return cast(Dataset, raw_ds["val"])
+    available = ", ".join(str(k) for k in raw_ds.keys())
+    raise KeyError(
+        "Could not infer eval split for callback rows. Strict policy requires 'val'. "
+        f"Available splits: [{available}]"
+    )
+
+
+def _resolve_default_callbacks(context: RunContext) -> list[TrainerCallback]:
+    cfg = context.cfg
+    if not cfg.custom_callbacks.enabled:
+        LOGGER.info("Default custom callbacks disabled by config.")
+        return []
+    if not _is_prolog_like_dataset(cfg.dataset_dir):
+        LOGGER.info(
+            "Default PrologAccuracyCallback not attached: dataset is not prolog-like (%s).",
+            cfg.dataset_dir,
+        )
+        return []
+
+    try:
+        eval_rows = _resolve_eval_rows(context.raw_dataset)
+        template = resolve_prompt_template(cfg.dataset_dir, eval_rows)
+        gt_map = load_ground_truth_map(cfg.dataset_dir)
+    except Exception as e:
+        LOGGER.warning("Could not attach default PrologAccuracyCallback: %s", e)
+        return []
+
+    LOGGER.info(
+        (
+            "Attached default PrologAccuracyCallback "
+            "(max_samples=%d, eval_every_steps=%d, workers=%d, generation_batch_size=%d, "
+            "generation_num_beams=%d, generation_max_new_tokens=%d)."
+        ),
+        cfg.custom_callbacks.max_samples,
+        cfg.custom_callbacks.eval_every_steps,
+        CUSTOM_CALLBACKS_WORKERS,
+        cfg.custom_callbacks.generation_batch_size,
+        cfg.custom_callbacks.generation_num_beams,
+        cfg.custom_callbacks.generation_max_new_tokens,
+    )
+    return [
+        PrologAccuracyCallback(
+            tokenizer=context.tokenizer,
+            eval_rows=eval_rows,
+            gt_map=gt_map,
+            template=template,
+            max_samples=cfg.custom_callbacks.max_samples,
+            eval_every_steps=cfg.custom_callbacks.eval_every_steps,
+            workers=CUSTOM_CALLBACKS_WORKERS,
+            generation_batch_size=cfg.custom_callbacks.generation_batch_size,
+            generation_num_beams=cfg.custom_callbacks.generation_num_beams,
+            generation_max_new_tokens=cfg.custom_callbacks.generation_max_new_tokens,
+        )
+    ]
+
+
 def run(
     cfg: TrainConfig,
     *,
+    strategy: ModelBuildStrategy,
     callbacks: Sequence[CallbackLike] | None = None,
 ) -> None:
     """
@@ -460,18 +685,27 @@ def run(
         return
 
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
+    if _resolve_hf_token(cfg) is None:
+        LOGGER.warning(
+            "HF token not detected. Downloads will be unauthenticated and may be rate-limited."
+        )
+    else:
+        LOGGER.info("HF token detected. Using authenticated Hugging Face Hub requests.")
 
     tokenizer = build_tokenizer(cfg)
-    model = cast(AutoModelForCausalLM, build_model(cfg))
+    model = cast(AutoModelForCausalLM, strategy.build_model(cfg))
     context = RunContext(cfg=cfg, tokenizer=tokenizer, raw_dataset=raw_ds)
-    callbacks = _resolve_callbacks(callbacks, context=context)
+    user_callbacks = _resolve_callbacks(callbacks, context=context)
+    resolved_callbacks: list[TrainerCallback] = list(user_callbacks)
+    if not any(isinstance(cb, PrologAccuracyCallback) for cb in resolved_callbacks):
+        resolved_callbacks.extend(_resolve_default_callbacks(context))
     trainer = build_trainer(
         cfg,
         model=model,
         tokenizer=tokenizer,
         train_ds=train_ds,
         eval_ds=eval_ds,
-        callbacks=callbacks,
+        callbacks=resolved_callbacks,
     )
 
     train_result = trainer.train()
@@ -490,8 +724,12 @@ def run(
 
 
 def main() -> None:
-    cfg = parse_args()
-    run(cfg)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+    )
+    cfg, strategy = parse_args()
+    run(cfg, strategy=strategy)
 
 
 if __name__ == "__main__":
