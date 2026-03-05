@@ -1,6 +1,9 @@
 from __future__ import annotations
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+import json
+from pathlib import Path
 from typing import Any
+import warnings
 
 from src.prolog.execute import execute_solve
 from src.training.data import PromptTemplate, build_prompt_text
@@ -78,6 +81,32 @@ class PrologAccuracyCallback(TrainerCallback):
         self.generation_batch_size = generation_batch_size
         self.generation_num_beams = generation_num_beams
         self.generation_max_new_tokens = generation_max_new_tokens
+        self.last_result: dict[str, Any] | None = None
+        self.history: list[dict[str, Any]] = []
+
+    def _append_run_metrics(self, output_dir: str, result: dict[str, Any]) -> None:
+        output_path = Path(output_dir) / "prolog_accuracy_metrics.jsonl"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(result) + "\n")
+
+    def _write_checkpoint_metrics(self, output_dir: str, step: int) -> None:
+        if self.last_result is None:
+            return
+        checkpoint_dir = Path(output_dir) / f"checkpoint-{step}"
+        if not checkpoint_dir.exists():
+            return
+        checkpoint_payload = {
+            "latest": self.last_result,
+            "history": self.history,
+        }
+        checkpoint_path = checkpoint_dir / "prolog_accuracy_metrics.json"
+        with checkpoint_path.open("w", encoding="utf-8") as f:
+            json.dump(checkpoint_payload, f, indent=2)
+
+    def on_save(self, args, state, control, **kwargs) -> None:
+        if state.is_world_process_zero:
+            self._write_checkpoint_metrics(str(args.output_dir), int(state.global_step))
 
     def on_evaluate(self,
                     args,
@@ -208,14 +237,23 @@ class PrologAccuracyCallback(TrainerCallback):
                     )
                     inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
-                    with torch.no_grad():
-                        out = model.generate(
-                            **inputs,
-                            max_new_tokens=self.generation_max_new_tokens,
-                            num_beams=self.generation_num_beams,
-                            do_sample=False,
-                            pad_token_id=self.tokenizer.pad_token_id,
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings(
+                            "ignore",
+                            message=(
+                                r"MatMul8bitLt: inputs will be cast from "
+                                r"torch\.float32 to float16 during quantization"
+                            ),
+                            category=UserWarning,
                         )
+                        with torch.no_grad():
+                            out = model.generate(
+                                **inputs,
+                                max_new_tokens=self.generation_max_new_tokens,
+                                num_beams=self.generation_num_beams,
+                                do_sample=False,
+                                pad_token_id=self.tokenizer.pad_token_id,
+                            )
 
                     if "attention_mask" in inputs:
                         input_lengths = inputs["attention_mask"].sum(dim=1).tolist()
@@ -255,6 +293,16 @@ class PrologAccuracyCallback(TrainerCallback):
 
         acc = correct / n if n else 0.0
         exec_rate = exec_ok / n if n else 0.0
+        result = {
+            "step": step,
+            "epoch": epoch,
+            "samples": n,
+            "exec_ok_rate": exec_rate,
+            "answer_accuracy": acc,
+        }
+        self.last_result = result
+        self.history.append(result)
+        self._append_run_metrics(str(args.output_dir), result)
 
         logging.info(
             (
@@ -266,6 +314,13 @@ class PrologAccuracyCallback(TrainerCallback):
             epoch,
             exec_rate,
             acc,
+        )
+        print(
+            (
+                f"[PrologAccuracyCallback] step={step} epoch={epoch:.4f} "
+                f"exec_ok_rate={exec_rate:.4f} answer_accuracy={acc:.4f}"
+            ),
+            flush=True,
         )
         
         if isinstance(metrics, dict):

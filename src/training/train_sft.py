@@ -2,6 +2,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import warnings
+from datetime import datetime
 
 import argparse
 from dataclasses import dataclass, field
@@ -44,6 +46,17 @@ except ImportError:
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TRAINING_RESULTS_DIR = REPO_ROOT / "outputs" / "training"
 LOGGER = logging.getLogger(__name__)
+
+
+def _configure_runtime_warning_filters() -> None:
+    warnings.filterwarnings(
+        "ignore",
+        message=(
+            r"MatMul8bitLt: inputs will be cast from "
+            r"torch\.float32 to float16 during quantization"
+        ),
+        category=UserWarning,
+    )
 
 def load_ground_truth_map(dataset_dir: Path) -> dict[str, str]:
     """
@@ -234,6 +247,68 @@ def _resolve_dataset_dir(
     return base_dir / dataset_name
 
 
+def _safe_output_component(value: str) -> str:
+    cleaned = "".join(
+        ch if (ch.isalnum() or ch in {"_", "-", "."}) else "_"
+        for ch in value.strip().lower()
+    )
+    return cleaned or "run"
+
+
+def _infer_dataset_slug(
+    *,
+    dataset_name: str | None,
+    dataset_dir: Path,
+    proper_ratio: str,
+) -> str:
+    if dataset_name == "gsm8k_prolog":
+        return "gsm8k_prolog"
+    if dataset_name == "openai_gsm8k":
+        return "openai_gsm8k"
+    if dataset_name == "gsm8k_proper":
+        ratio = _normalize_ratio_dir_name(proper_ratio)
+        return f"gsm8k_proper_{ratio}"
+
+    lowered_parts = [part.lower() for part in dataset_dir.parts]
+    if "gsm8k_prolog" in lowered_parts:
+        return "gsm8k_prolog"
+    if "openai_gsm8k" in lowered_parts:
+        return "openai_gsm8k"
+    if "gsm8k_proper" in lowered_parts:
+        ratio_component = next(
+            (part for part in dataset_dir.parts if part.lower().startswith("ratio_")),
+            "ratio_unknown",
+        )
+        return f"gsm8k_proper_{_safe_output_component(ratio_component)}"
+
+    return _safe_output_component(dataset_dir.name)
+
+
+def _resolve_output_dir(
+    *,
+    output_dir: Path | None,
+    dataset_name: str | None,
+    dataset_dir: Path,
+    proper_ratio: str,
+) -> Path:
+    if output_dir is not None:
+        return output_dir
+
+    dataset_slug = _infer_dataset_slug(
+        dataset_name=dataset_name,
+        dataset_dir=dataset_dir,
+        proper_ratio=proper_ratio,
+    )
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base = TRAINING_RESULTS_DIR / f"{dataset_slug}_{timestamp}"
+    candidate = base
+    suffix = 1
+    while candidate.exists():
+        candidate = TRAINING_RESULTS_DIR / f"{dataset_slug}_{timestamp}_{suffix}"
+        suffix += 1
+    return candidate
+
+
 def parse_args() -> tuple[TrainConfig, ModelBuildStrategy]:
     parser = argparse.ArgumentParser(
         description="SFT scaffold for PROPER/GSM8K-Prolog data."
@@ -263,7 +338,15 @@ def parse_args() -> tuple[TrainConfig, ModelBuildStrategy]:
         default="1to2",
         help='Used with --dataset-name gsm8k_proper. Accepts "1to2" or "ratio_1to2".',
     )
-    parser.add_argument("--output-dir", type=Path, default=TRAINING_RESULTS_DIR)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Run output directory. If omitted, defaults to "
+            "outputs/training/<dataset_or_ratio>_<timestamp>."
+        ),
+    )
     parser.add_argument("--model-name-or-path", type=str, required=True)
     parser.add_argument(
         "--hf-token",
@@ -376,10 +459,16 @@ def parse_args() -> tuple[TrainConfig, ModelBuildStrategy]:
         dataset_name=args.dataset_name,
         proper_ratio=args.proper_ratio,
     )
+    resolved_output_dir = _resolve_output_dir(
+        output_dir=args.output_dir,
+        dataset_name=args.dataset_name,
+        dataset_dir=resolved_dataset_dir,
+        proper_ratio=args.proper_ratio,
+    )
 
     cfg = TrainConfig(
         dataset_dir=resolved_dataset_dir,
-        output_dir=args.output_dir,
+        output_dir=resolved_output_dir,
         model_name_or_path=args.model_name_or_path,
         max_train_samples=args.max_train_samples,
         max_eval_samples=args.max_eval_samples,
@@ -673,6 +762,7 @@ def run(
     - a factory callable taking `RunContext` and returning one or many callbacks
     """
     raw_ds = load_prepared_dataset(cfg.dataset_dir)
+    _configure_runtime_warning_filters()
     train_ds, eval_ds = load_training_splits(
         cfg.dataset_dir,
         max_train_samples=cfg.max_train_samples,
@@ -685,6 +775,7 @@ def run(
         return
 
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
+    LOGGER.info("Training outputs directory: %s", cfg.output_dir)
     if _resolve_hf_token(cfg) is None:
         LOGGER.warning(
             "HF token not detected. Downloads will be unauthenticated and may be rate-limited."
