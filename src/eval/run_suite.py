@@ -303,15 +303,13 @@ def _generate_batch(
             pad_token_id=tokenizer.pad_token_id,
         )
 
-    if "attention_mask" in inputs:
-        input_lengths = inputs["attention_mask"].sum(dim=1).tolist()
-    else:
-        input_len = int(inputs["input_ids"].shape[1])
-        input_lengths = [input_len for _ in prompts]
-
+    # For decoder-only generation, returned sequences include the full padded
+    # input width. With left padding, slicing by attention_mask.sum would keep
+    # part of the prompt, so always slice by the input tensor width.
+    input_len = int(inputs["input_ids"].shape[1])
     completions: list[str] = []
-    for i, prompt_len in enumerate(input_lengths):
-        gen_ids = out[i][int(prompt_len):]
+    for i in range(len(prompts)):
+        gen_ids = out[i][input_len:]
         completions.append(tokenizer.decode(gen_ids, skip_special_tokens=True))
     return completions
 

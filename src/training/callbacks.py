@@ -300,16 +300,13 @@ class PrologAccuracyCallback(TrainerCallback):
                                 pad_token_id=self.tokenizer.pad_token_id,
                             )
 
-                    if "attention_mask" in inputs:
-                        input_lengths = inputs["attention_mask"].sum(dim=1).tolist()
-                    else:
-                        input_len = int(inputs["input_ids"].shape[1])
-                        input_lengths = [input_len for _ in batch_rows]
-
+                    # For decoder-only generation, returned sequences include
+                    # the full padded input width. With left padding, slicing
+                    # by attention_mask.sum would keep part of the prompt.
+                    input_len = int(inputs["input_ids"].shape[1])
                     batch_preds: list[tuple[str, str]] = []
                     for idx, expected in enumerate(expected_batch):
-                        prompt_len = int(input_lengths[idx])
-                        gen_ids = out[idx][prompt_len:]
+                        gen_ids = out[idx][input_len:]
                         pred_code = self.tokenizer.decode(
                             gen_ids,
                             skip_special_tokens=True,
