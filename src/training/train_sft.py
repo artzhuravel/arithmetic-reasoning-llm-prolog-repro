@@ -2,6 +2,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import warnings
+from datetime import datetime
 
 import argparse
 from dataclasses import dataclass, field
@@ -31,12 +33,14 @@ import torch
 try:
     from peft import (
         LoraConfig as PeftLoraConfig,
+        PeftModel,
         TaskType,
         get_peft_model,
         prepare_model_for_kbit_training,
     )
 except ImportError:
     PeftLoraConfig = None
+    PeftModel = None
     TaskType = None
     get_peft_model = None
     prepare_model_for_kbit_training = None
@@ -44,6 +48,17 @@ except ImportError:
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TRAINING_RESULTS_DIR = REPO_ROOT / "outputs" / "training"
 LOGGER = logging.getLogger(__name__)
+
+
+def _configure_runtime_warning_filters() -> None:
+    warnings.filterwarnings(
+        "ignore",
+        message=(
+            r"MatMul8bitLt: inputs will be cast from "
+            r"torch\.float32 to float16 during quantization"
+        ),
+        category=UserWarning,
+    )
 
 def load_ground_truth_map(dataset_dir: Path) -> dict[str, str]:
     """
@@ -103,6 +118,7 @@ class TrainConfig:
     torch_dtype: str = "bfloat16"
     device_map: str | None = "auto"
     hf_token: str | None = None
+    merge_adapter_after_training: bool = False
     dry_run: bool = False
 
 
@@ -234,6 +250,68 @@ def _resolve_dataset_dir(
     return base_dir / dataset_name
 
 
+def _safe_output_component(value: str) -> str:
+    cleaned = "".join(
+        ch if (ch.isalnum() or ch in {"_", "-", "."}) else "_"
+        for ch in value.strip().lower()
+    )
+    return cleaned or "run"
+
+
+def _infer_dataset_slug(
+    *,
+    dataset_name: str | None,
+    dataset_dir: Path,
+    proper_ratio: str,
+) -> str:
+    if dataset_name == "gsm8k_prolog":
+        return "gsm8k_prolog"
+    if dataset_name == "openai_gsm8k":
+        return "openai_gsm8k"
+    if dataset_name == "gsm8k_proper":
+        ratio = _normalize_ratio_dir_name(proper_ratio)
+        return f"gsm8k_proper_{ratio}"
+
+    lowered_parts = [part.lower() for part in dataset_dir.parts]
+    if "gsm8k_prolog" in lowered_parts:
+        return "gsm8k_prolog"
+    if "openai_gsm8k" in lowered_parts:
+        return "openai_gsm8k"
+    if "gsm8k_proper" in lowered_parts:
+        ratio_component = next(
+            (part for part in dataset_dir.parts if part.lower().startswith("ratio_")),
+            "ratio_unknown",
+        )
+        return f"gsm8k_proper_{_safe_output_component(ratio_component)}"
+
+    return _safe_output_component(dataset_dir.name)
+
+
+def _resolve_output_dir(
+    *,
+    output_dir: Path | None,
+    dataset_name: str | None,
+    dataset_dir: Path,
+    proper_ratio: str,
+) -> Path:
+    if output_dir is not None:
+        return output_dir
+
+    dataset_slug = _infer_dataset_slug(
+        dataset_name=dataset_name,
+        dataset_dir=dataset_dir,
+        proper_ratio=proper_ratio,
+    )
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base = TRAINING_RESULTS_DIR / f"{dataset_slug}_{timestamp}"
+    candidate = base
+    suffix = 1
+    while candidate.exists():
+        candidate = TRAINING_RESULTS_DIR / f"{dataset_slug}_{timestamp}_{suffix}"
+        suffix += 1
+    return candidate
+
+
 def parse_args() -> tuple[TrainConfig, ModelBuildStrategy]:
     parser = argparse.ArgumentParser(
         description="SFT scaffold for PROPER/GSM8K-Prolog data."
@@ -263,7 +341,15 @@ def parse_args() -> tuple[TrainConfig, ModelBuildStrategy]:
         default="1to2",
         help='Used with --dataset-name gsm8k_proper. Accepts "1to2" or "ratio_1to2".',
     )
-    parser.add_argument("--output-dir", type=Path, default=TRAINING_RESULTS_DIR)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Run output directory. If omitted, defaults to "
+            "outputs/training/<dataset_or_ratio>_<timestamp>."
+        ),
+    )
     parser.add_argument("--model-name-or-path", type=str, required=True)
     parser.add_argument(
         "--hf-token",
@@ -347,6 +433,14 @@ def parse_args() -> tuple[TrainConfig, ModelBuildStrategy]:
         default="auto",
         help='Model placement strategy, e.g. "auto" or "none".',
     )
+    parser.add_argument(
+        "--merge-adapter-after-training",
+        action="store_true",
+        help=(
+            "When set, merge LoRA adapter weights into the base model at the end of "
+            "training and save the merged model in --output-dir."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
 
     args = parser.parse_args()
@@ -376,10 +470,16 @@ def parse_args() -> tuple[TrainConfig, ModelBuildStrategy]:
         dataset_name=args.dataset_name,
         proper_ratio=args.proper_ratio,
     )
+    resolved_output_dir = _resolve_output_dir(
+        output_dir=args.output_dir,
+        dataset_name=args.dataset_name,
+        dataset_dir=resolved_dataset_dir,
+        proper_ratio=args.proper_ratio,
+    )
 
     cfg = TrainConfig(
         dataset_dir=resolved_dataset_dir,
-        output_dir=args.output_dir,
+        output_dir=resolved_output_dir,
         model_name_or_path=args.model_name_or_path,
         max_train_samples=args.max_train_samples,
         max_eval_samples=args.max_eval_samples,
@@ -401,6 +501,7 @@ def parse_args() -> tuple[TrainConfig, ModelBuildStrategy]:
         torch_dtype=args.torch_dtype,
         device_map=resolved_device_map,
         hf_token=args.hf_token,
+        merge_adapter_after_training=args.merge_adapter_after_training,
         dry_run=args.dry_run,
     )
     strategy: ModelBuildStrategy
@@ -495,6 +596,77 @@ def _build_quantization_config(
     raise ValueError(
         f"Unsupported quantization '{quantization}'. Use one of: none, 8bit, 4bit."
     )
+
+
+def merge_lora_adapter_into_base(
+    *,
+    adapter_dir: Path,
+    output_dir: Path,
+    base_model_name_or_path: str | None = None,
+    torch_dtype: str = "auto",
+    device_map: str | None = "auto",
+    hf_token: str | None = None,
+) -> Path:
+    """
+    Merge a LoRA adapter into its base model and save a standalone merged model.
+
+    This helper is intentionally standalone and not yet integrated into the
+    training CLI flow.
+    """
+    if PeftModel is None:
+        raise ImportError(
+            "PEFT is required for merging adapters. Install with: pip install peft"
+        )
+    if not adapter_dir.exists():
+        raise FileNotFoundError(f"Adapter directory not found: {adapter_dir}")
+
+    resolved_base_model = base_model_name_or_path
+    if resolved_base_model is None:
+        raise ValueError(
+                "Could not resolve base model name. "
+                "Pass base_model_name_or_path explicitly."
+            )
+        
+    resolved_token = hf_token.strip() if hf_token and hf_token.strip() else None
+
+    model_kwargs: dict[str, Any] = {"torch_dtype": _resolve_torch_dtype(torch_dtype)}
+    if device_map is not None:
+        model_kwargs["device_map"] = device_map
+    if resolved_token is not None:
+        model_kwargs["token"] = resolved_token
+
+    LOGGER.info("Loading base model for merge: %s", resolved_base_model)
+    base_model = AutoModelForCausalLM.from_pretrained(
+        resolved_base_model,
+        **model_kwargs,
+    )
+
+    adapter_kwargs: dict[str, Any] = {}
+    if resolved_token is not None:
+        adapter_kwargs["token"] = resolved_token
+
+    LOGGER.info("Loading LoRA adapter from: %s", adapter_dir)
+    peft_model = cast(Any, PeftModel).from_pretrained(
+        base_model,
+        str(adapter_dir),
+        **adapter_kwargs,
+    )
+    LOGGER.info("Merging adapter into base model.")
+    merged_model = peft_model.merge_and_unload()
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    merged_model.save_pretrained(str(output_dir), safe_serialization=True)
+
+    tokenizer_kwargs: dict[str, Any] = {}
+    if resolved_token is not None:
+        tokenizer_kwargs["token"] = resolved_token
+    tokenizer = AutoTokenizer.from_pretrained(
+        resolved_base_model,
+        **tokenizer_kwargs,
+    )
+    tokenizer.save_pretrained(str(output_dir))
+    LOGGER.info("Saved merged model and tokenizer to: %s", output_dir)
+    return output_dir
 
 
 def build_trainer(cfg: TrainConfig,
@@ -673,6 +845,7 @@ def run(
     - a factory callable taking `RunContext` and returning one or many callbacks
     """
     raw_ds = load_prepared_dataset(cfg.dataset_dir)
+    _configure_runtime_warning_filters()
     train_ds, eval_ds = load_training_splits(
         cfg.dataset_dir,
         max_train_samples=cfg.max_train_samples,
@@ -685,6 +858,7 @@ def run(
         return
 
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
+    LOGGER.info("Training outputs directory: %s", cfg.output_dir)
     if _resolve_hf_token(cfg) is None:
         LOGGER.warning(
             "HF token not detected. Downloads will be unauthenticated and may be rate-limited."
@@ -721,6 +895,28 @@ def run(
     eval_metrics["eval_samples"] = len(eval_ds)
     trainer.log_metrics("eval", eval_metrics)
     trainer.save_metrics("eval", eval_metrics)
+
+    if cfg.merge_adapter_after_training:
+        if isinstance(strategy, LoraFineTuneStrategy):
+            LOGGER.info(
+                "Merging LoRA adapter into base model and saving merged weights to: %s",
+                cfg.output_dir,
+            )
+            merge_lora_adapter_into_base(
+                adapter_dir=cfg.output_dir,
+                output_dir=cfg.output_dir,
+                base_model_name_or_path=cfg.model_name_or_path,
+                torch_dtype=cfg.torch_dtype,
+                device_map=cfg.device_map,
+                hf_token=_resolve_hf_token(cfg),
+            )
+        else:
+            LOGGER.warning(
+                (
+                    "--merge-adapter-after-training was set, but training strategy is "
+                    "'full' (no LoRA adapter to merge). Skipping merge."
+                )
+            )
 
 
 def main() -> None:

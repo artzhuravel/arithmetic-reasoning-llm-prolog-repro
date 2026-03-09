@@ -1,8 +1,11 @@
 from __future__ import annotations
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from typing import Any
+import json
+from pathlib import Path
+from typing import Any, Sequence
+import warnings
 
-from src.prolog.execute import execute_solve
+from src.prolog.execute import PrologExecutionResult, execute_solve
 from src.training.data import PromptTemplate, build_prompt_text
 from transformers import TrainerCallback
 import torch
@@ -42,6 +45,53 @@ def _load_tqdm() -> Any:
 tqdm = _load_tqdm()
 
 
+def score_predicted_prolog(
+    pred_code: str,
+    expected: str,
+) -> tuple[int, int, PrologExecutionResult]:
+    """
+    Execute predicted Prolog code and compare normalized answer to expected.
+
+    Returns:
+    - exec_ok_inc: 1 when execution succeeded else 0
+    - correct_inc: 1 when execution succeeded and answer matches expected else 0
+    - result: full PrologExecutionResult
+    """
+    got = execute_solve(pred_code)
+    if not got.ok:
+        return 0, 0, got
+    return 1, 1 if got.normalized_answer == expected else 0, got
+
+
+def score_predicted_prolog_batch(
+    items: Sequence[tuple[str, str]],
+    *,
+    workers: int = 1,
+    executor: ThreadPoolExecutor | None = None,
+) -> list[tuple[int, int, PrologExecutionResult]]:
+    """
+    Batch variant of score_predicted_prolog with optional thread workers.
+
+    Input item format: (predicted_prolog_code, expected_normalized_answer).
+    When `executor` is provided, it is reused instead of creating a new pool.
+    """
+    if workers < 1:
+        raise ValueError("workers must be >= 1")
+
+    def _score_item(item: tuple[str, str]) -> tuple[int, int, PrologExecutionResult]:
+        pred_code, expected = item
+        return score_predicted_prolog(pred_code, expected)
+
+    if executor is not None:
+        return list(executor.map(_score_item, items))
+
+    if workers == 1:
+        return [_score_item(item) for item in items]
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        return list(executor.map(_score_item, items))
+
+
 class PrologAccuracyCallback(TrainerCallback):
     def __init__(
         self,
@@ -78,6 +128,32 @@ class PrologAccuracyCallback(TrainerCallback):
         self.generation_batch_size = generation_batch_size
         self.generation_num_beams = generation_num_beams
         self.generation_max_new_tokens = generation_max_new_tokens
+        self.last_result: dict[str, Any] | None = None
+        self.history: list[dict[str, Any]] = []
+
+    def _append_run_metrics(self, output_dir: str, result: dict[str, Any]) -> None:
+        output_path = Path(output_dir) / "prolog_accuracy_metrics.jsonl"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(result) + "\n")
+
+    def _write_checkpoint_metrics(self, output_dir: str, step: int) -> None:
+        if self.last_result is None:
+            return
+        checkpoint_dir = Path(output_dir) / f"checkpoint-{step}"
+        if not checkpoint_dir.exists():
+            return
+        checkpoint_payload = {
+            "latest": self.last_result,
+            "history": self.history,
+        }
+        checkpoint_path = checkpoint_dir / "prolog_accuracy_metrics.json"
+        with checkpoint_path.open("w", encoding="utf-8") as f:
+            json.dump(checkpoint_payload, f, indent=2)
+
+    def on_save(self, args, state, control, **kwargs) -> None:
+        if state.is_world_process_zero:
+            self._write_checkpoint_metrics(str(args.output_dir), int(state.global_step))
 
     def on_evaluate(self,
                     args,
@@ -128,10 +204,8 @@ class PrologAccuracyCallback(TrainerCallback):
 
         def _score_single(item: tuple[str, str]) -> tuple[int, int]:
             pred_code, expected = item
-            got = execute_solve(pred_code)
-            if not got.ok:
-                return 0, 0
-            return 1, 1 if got.normalized_answer == expected else 0
+            exec_ok_inc, correct_inc, _ = score_predicted_prolog(pred_code, expected)
+            return exec_ok_inc, correct_inc
 
         exec_ok = 0
         correct = 0
@@ -208,25 +282,31 @@ class PrologAccuracyCallback(TrainerCallback):
                     )
                     inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
-                    with torch.no_grad():
-                        out = model.generate(
-                            **inputs,
-                            max_new_tokens=self.generation_max_new_tokens,
-                            num_beams=self.generation_num_beams,
-                            do_sample=False,
-                            pad_token_id=self.tokenizer.pad_token_id,
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings(
+                            "ignore",
+                            message=(
+                                r"MatMul8bitLt: inputs will be cast from "
+                                r"torch\.float32 to float16 during quantization"
+                            ),
+                            category=UserWarning,
                         )
+                        with torch.no_grad():
+                            out = model.generate(
+                                **inputs,
+                                max_new_tokens=self.generation_max_new_tokens,
+                                num_beams=self.generation_num_beams,
+                                do_sample=False,
+                                pad_token_id=self.tokenizer.pad_token_id,
+                            )
 
-                    if "attention_mask" in inputs:
-                        input_lengths = inputs["attention_mask"].sum(dim=1).tolist()
-                    else:
-                        input_len = int(inputs["input_ids"].shape[1])
-                        input_lengths = [input_len for _ in batch_rows]
-
+                    # For decoder-only generation, returned sequences include
+                    # the full padded input width. With left padding, slicing
+                    # by attention_mask.sum would keep part of the prompt.
+                    input_len = int(inputs["input_ids"].shape[1])
                     batch_preds: list[tuple[str, str]] = []
                     for idx, expected in enumerate(expected_batch):
-                        prompt_len = int(input_lengths[idx])
-                        gen_ids = out[idx][prompt_len:]
+                        gen_ids = out[idx][input_len:]
                         pred_code = self.tokenizer.decode(
                             gen_ids,
                             skip_special_tokens=True,
@@ -255,6 +335,16 @@ class PrologAccuracyCallback(TrainerCallback):
 
         acc = correct / n if n else 0.0
         exec_rate = exec_ok / n if n else 0.0
+        result = {
+            "step": step,
+            "epoch": epoch,
+            "samples": n,
+            "exec_ok_rate": exec_rate,
+            "answer_accuracy": acc,
+        }
+        self.last_result = result
+        self.history.append(result)
+        self._append_run_metrics(str(args.output_dir), result)
 
         logging.info(
             (
@@ -266,6 +356,13 @@ class PrologAccuracyCallback(TrainerCallback):
             epoch,
             exec_rate,
             acc,
+        )
+        print(
+            (
+                f"[PrologAccuracyCallback] step={step} epoch={epoch:.4f} "
+                f"exec_ok_rate={exec_rate:.4f} answer_accuracy={acc:.4f}"
+            ),
+            flush=True,
         )
         
         if isinstance(metrics, dict):
