@@ -2,10 +2,10 @@ from __future__ import annotations
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 import warnings
 
-from src.prolog.execute import execute_solve
+from src.prolog.execute import PrologExecutionResult, execute_solve
 from src.training.data import PromptTemplate, build_prompt_text
 from transformers import TrainerCallback
 import torch
@@ -43,6 +43,53 @@ def _load_tqdm() -> Any:
 
 
 tqdm = _load_tqdm()
+
+
+def score_predicted_prolog(
+    pred_code: str,
+    expected: str,
+) -> tuple[int, int, PrologExecutionResult]:
+    """
+    Execute predicted Prolog code and compare normalized answer to expected.
+
+    Returns:
+    - exec_ok_inc: 1 when execution succeeded else 0
+    - correct_inc: 1 when execution succeeded and answer matches expected else 0
+    - result: full PrologExecutionResult
+    """
+    got = execute_solve(pred_code)
+    if not got.ok:
+        return 0, 0, got
+    return 1, 1 if got.normalized_answer == expected else 0, got
+
+
+def score_predicted_prolog_batch(
+    items: Sequence[tuple[str, str]],
+    *,
+    workers: int = 1,
+    executor: ThreadPoolExecutor | None = None,
+) -> list[tuple[int, int, PrologExecutionResult]]:
+    """
+    Batch variant of score_predicted_prolog with optional thread workers.
+
+    Input item format: (predicted_prolog_code, expected_normalized_answer).
+    When `executor` is provided, it is reused instead of creating a new pool.
+    """
+    if workers < 1:
+        raise ValueError("workers must be >= 1")
+
+    def _score_item(item: tuple[str, str]) -> tuple[int, int, PrologExecutionResult]:
+        pred_code, expected = item
+        return score_predicted_prolog(pred_code, expected)
+
+    if executor is not None:
+        return list(executor.map(_score_item, items))
+
+    if workers == 1:
+        return [_score_item(item) for item in items]
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        return list(executor.map(_score_item, items))
 
 
 class PrologAccuracyCallback(TrainerCallback):
@@ -157,10 +204,8 @@ class PrologAccuracyCallback(TrainerCallback):
 
         def _score_single(item: tuple[str, str]) -> tuple[int, int]:
             pred_code, expected = item
-            got = execute_solve(pred_code)
-            if not got.ok:
-                return 0, 0
-            return 1, 1 if got.normalized_answer == expected else 0
+            exec_ok_inc, correct_inc, _ = score_predicted_prolog(pred_code, expected)
+            return exec_ok_inc, correct_inc
 
         exec_ok = 0
         correct = 0

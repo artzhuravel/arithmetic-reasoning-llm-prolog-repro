@@ -33,12 +33,14 @@ import torch
 try:
     from peft import (
         LoraConfig as PeftLoraConfig,
+        PeftModel,
         TaskType,
         get_peft_model,
         prepare_model_for_kbit_training,
     )
 except ImportError:
     PeftLoraConfig = None
+    PeftModel = None
     TaskType = None
     get_peft_model = None
     prepare_model_for_kbit_training = None
@@ -116,6 +118,7 @@ class TrainConfig:
     torch_dtype: str = "bfloat16"
     device_map: str | None = "auto"
     hf_token: str | None = None
+    merge_adapter_after_training: bool = False
     dry_run: bool = False
 
 
@@ -430,6 +433,14 @@ def parse_args() -> tuple[TrainConfig, ModelBuildStrategy]:
         default="auto",
         help='Model placement strategy, e.g. "auto" or "none".',
     )
+    parser.add_argument(
+        "--merge-adapter-after-training",
+        action="store_true",
+        help=(
+            "When set, merge LoRA adapter weights into the base model at the end of "
+            "training and save the merged model in --output-dir."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
 
     args = parser.parse_args()
@@ -490,6 +501,7 @@ def parse_args() -> tuple[TrainConfig, ModelBuildStrategy]:
         torch_dtype=args.torch_dtype,
         device_map=resolved_device_map,
         hf_token=args.hf_token,
+        merge_adapter_after_training=args.merge_adapter_after_training,
         dry_run=args.dry_run,
     )
     strategy: ModelBuildStrategy
@@ -584,6 +596,77 @@ def _build_quantization_config(
     raise ValueError(
         f"Unsupported quantization '{quantization}'. Use one of: none, 8bit, 4bit."
     )
+
+
+def merge_lora_adapter_into_base(
+    *,
+    adapter_dir: Path,
+    output_dir: Path,
+    base_model_name_or_path: str | None = None,
+    torch_dtype: str = "auto",
+    device_map: str | None = "auto",
+    hf_token: str | None = None,
+) -> Path:
+    """
+    Merge a LoRA adapter into its base model and save a standalone merged model.
+
+    This helper is intentionally standalone and not yet integrated into the
+    training CLI flow.
+    """
+    if PeftModel is None:
+        raise ImportError(
+            "PEFT is required for merging adapters. Install with: pip install peft"
+        )
+    if not adapter_dir.exists():
+        raise FileNotFoundError(f"Adapter directory not found: {adapter_dir}")
+
+    resolved_base_model = base_model_name_or_path
+    if resolved_base_model is None:
+        raise ValueError(
+                "Could not resolve base model name. "
+                "Pass base_model_name_or_path explicitly."
+            )
+        
+    resolved_token = hf_token.strip() if hf_token and hf_token.strip() else None
+
+    model_kwargs: dict[str, Any] = {"torch_dtype": _resolve_torch_dtype(torch_dtype)}
+    if device_map is not None:
+        model_kwargs["device_map"] = device_map
+    if resolved_token is not None:
+        model_kwargs["token"] = resolved_token
+
+    LOGGER.info("Loading base model for merge: %s", resolved_base_model)
+    base_model = AutoModelForCausalLM.from_pretrained(
+        resolved_base_model,
+        **model_kwargs,
+    )
+
+    adapter_kwargs: dict[str, Any] = {}
+    if resolved_token is not None:
+        adapter_kwargs["token"] = resolved_token
+
+    LOGGER.info("Loading LoRA adapter from: %s", adapter_dir)
+    peft_model = cast(Any, PeftModel).from_pretrained(
+        base_model,
+        str(adapter_dir),
+        **adapter_kwargs,
+    )
+    LOGGER.info("Merging adapter into base model.")
+    merged_model = peft_model.merge_and_unload()
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    merged_model.save_pretrained(str(output_dir), safe_serialization=True)
+
+    tokenizer_kwargs: dict[str, Any] = {}
+    if resolved_token is not None:
+        tokenizer_kwargs["token"] = resolved_token
+    tokenizer = AutoTokenizer.from_pretrained(
+        resolved_base_model,
+        **tokenizer_kwargs,
+    )
+    tokenizer.save_pretrained(str(output_dir))
+    LOGGER.info("Saved merged model and tokenizer to: %s", output_dir)
+    return output_dir
 
 
 def build_trainer(cfg: TrainConfig,
@@ -812,6 +895,28 @@ def run(
     eval_metrics["eval_samples"] = len(eval_ds)
     trainer.log_metrics("eval", eval_metrics)
     trainer.save_metrics("eval", eval_metrics)
+
+    if cfg.merge_adapter_after_training:
+        if isinstance(strategy, LoraFineTuneStrategy):
+            LOGGER.info(
+                "Merging LoRA adapter into base model and saving merged weights to: %s",
+                cfg.output_dir,
+            )
+            merge_lora_adapter_into_base(
+                adapter_dir=cfg.output_dir,
+                output_dir=cfg.output_dir,
+                base_model_name_or_path=cfg.model_name_or_path,
+                torch_dtype=cfg.torch_dtype,
+                device_map=cfg.device_map,
+                hf_token=_resolve_hf_token(cfg),
+            )
+        else:
+            LOGGER.warning(
+                (
+                    "--merge-adapter-after-training was set, but training strategy is "
+                    "'full' (no LoRA adapter to merge). Skipping merge."
+                )
+            )
 
 
 def main() -> None:
