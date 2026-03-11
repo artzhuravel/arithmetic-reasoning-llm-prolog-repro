@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import logging
 from pathlib import Path
 from typing import Any, Mapping, Optional, cast
+from src.prolog.execute import normalize_prolog_answer_for_eval
 
 from datasets import Dataset, DatasetDict, load_from_disk
 
@@ -212,6 +214,100 @@ def to_text_dataset(
         lambda row: format_record_for_sft(row, template=resolved_template),
         remove_columns=split.column_names,
         desc="Formatting SFT text",
+    )
+    
+    
+def format_record_for_rl(
+    row: dict[str, Any],
+    *,
+    template: PromptTemplate,
+    gt_map: dict[str, float],
+) -> dict[str, str]:
+    """
+    Build a single training text field from one of:
+    - Prolog-style rows: instruction/input/output
+    - OpenAI GSM8K rows: question/answer (with a default instruction)
+    """
+    prompt_key  = (
+        str(row["input"]).strip()
+        if "input" in row
+        else str(row.get("question", "")).strip()
+    )
+    expected_answer = gt_map.get(prompt_key, "")
+    if expected_answer is None or not expected_answer:
+        raise ValueError(f"Missing ground truth for prompt: {prompt_key[:120]!r}")
+    
+    return {
+        "prompt": build_prompt_text(row, template=template, include_output=False),
+        "prompt_key": prompt_key,
+        "expected_answer": str(expected_answer),
+    }
+    
+
+def to_rl_dataset(
+    split: Dataset,
+    *,
+    template: PromptTemplate,
+    gt_map: dict[str, float],
+) -> Dataset:
+    """
+    Convert split rows into a plain text field consumed by RL.
+    """
+    columns = set(split.column_names)
+    resolved_template = template or _resolve_template_from_columns(columns)
+    
+    return split.map(
+        lambda row: format_record_for_rl(row, template=resolved_template, gt_map=gt_map),
+        remove_columns=split.column_names,
+        desc="Formatting RL text",
+    )
+
+    
+    
+
+def preview_formatted_examples(train_ds: Any, eval_ds: Any, *, n: int = 1) -> None:
+    print(f"[data] train rows: {len(train_ds)}")
+    print(f"[data] eval rows:  {len(eval_ds)}")
+    for i in range(min(n, len(train_ds))):
+        print(f"\n[data] train sample #{i}")
+        print(train_ds[i]["text"][:800])
+
+    
+def load_ground_truth_map(dataset_dir: Path) -> dict[str, str]:
+    """
+    Load normalized ground-truth answers for any prepared dataset path in this repo.
+
+    Works for:
+    - .../gsm8k_proper/ratio_*/
+    - .../gsm8k_prolog/
+    - .../openai_gsm8k/
+    - and nested split directories such as .../gsm8k_prolog/train
+    """
+    cur = dataset_dir.resolve()
+    gt_path: Path | None = None
+    for candidate_dir in (cur, *cur.parents):
+        candidate = candidate_dir / "ground_truth_by_prompt.json"
+        if candidate.exists():
+            gt_path = candidate
+            break
+
+    if gt_path is None:
+        raise FileNotFoundError(
+            "Could not locate ground_truth_by_prompt.json from "
+            f"path: {dataset_dir}"
+        )
+
+    payload = json.loads(gt_path.read_text(encoding="utf-8"))
+    return {k.strip(): normalize_prolog_answer_for_eval(v) for k, v in payload["all"].items()}
+
+
+def resolve_eval_rows(raw_ds: DatasetDict) -> Dataset:
+    if "val" in raw_ds:
+        return cast(Dataset, raw_ds["val"])
+    available = ", ".join(str(k) for k in raw_ds.keys())
+    raise KeyError(
+        "Could not infer eval split for callback rows. Strict policy requires 'val'. "
+        f"Available splits: [{available}]"
     )
 
 
