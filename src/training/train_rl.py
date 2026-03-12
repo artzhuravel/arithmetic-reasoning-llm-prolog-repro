@@ -6,8 +6,8 @@ from pathlib import Path
 from transformers import AutoTokenizer
 from datasets import DatasetDict
 from src.data.prepare_splits import get_default_splits_dir
-from training.data import load_prepared_dataset, load_training_splits, preview_formatted_examples, resolve_eval_rows, resolve_prompt_template, load_ground_truth_map
-from src.training.helpers import _resolve_hf_token_from_cfg, build_tokenizer
+from src.training.data import load_prepared_dataset, load_training_splits, preview_formatted_examples, resolve_eval_rows, resolve_prompt_template, load_ground_truth_map
+from src.training.helpers import _resolve_hf_token_from_cfg, build_tokenizer, _resolve_dataset_dir
 
 TRAINING_RESULTS_DIR = Path(__file__).resolve().parents[2] / "outputs" / "training"
 LOGGER = logging.getLogger(__name__)
@@ -55,12 +55,12 @@ def run(cfg: RLTrainConfig) -> None:
     
     train_ds, eval_ds = load_training_splits(
         cfg.dataset_dir,
+        mode="rl",
         max_train_samples=cfg.max_train_samples,
         max_eval_samples=cfg.max_eval_samples
     )
     
     preview_formatted_examples(train_ds, eval_ds, n=1)
-    
     
     if cfg.dry_run:
         print("\n[dry-run] stopping before tokenizer/model/trainer setup.")
@@ -73,13 +73,14 @@ def run(cfg: RLTrainConfig) -> None:
     else:
         LOGGER.info("HF token detected. Using authenticated Hugging Face Hub requests.")
     
+    train_text, eval_text = load_training_splits(
+        cfg.dataset_dir,
+        mode="rl",
+        max_train_samples=cfg.max_train_samples,
+        max_eval_samples=cfg.max_eval_samples
+    )
     
     tokenizer = build_tokenizer(cfg)
-    
-    # context = RunContext(cfg=cfg, tokenizer=tokenizer, raw_dataset=raw_ds)
-    eval_rows = resolve_eval_rows(raw_ds)
-    template = resolve_prompt_template(cfg.dataset_dir, eval_rows)
-    gt_map = load_ground_truth_map(cfg.dataset_dir)
     
     pass
 
@@ -101,35 +102,8 @@ def run(cfg: RLTrainConfig) -> None:
 
 
 
-def _resolve_dataset_dir(
-    dataset_dir: Path | None = None,
-    splits_dir: Path | None = None,
-    dataset_name: str | None = None,
-    proper_ratio: str | None = None,
-) -> Path:
-    if dataset_dir is not None:
-        return dataset_dir
 
-    if dataset_name is None:
-        raise ValueError(
-            "Provide either --dataset-dir or --dataset-name "
-            "(gsm8k_prolog, openai_gsm8k, gsm8k_proper)."
-        )
 
-    splits_dir = splits_dir if splits_dir is not None else get_default_splits_dir()
-
-    if dataset_name == "gsm8k_proper":
-        if proper_ratio is None or not proper_ratio.strip():
-            raise ValueError("For gsm8k_proper, --proper-ratio is required.")
-        # no resolver: use value exactly as provided
-        return splits_dir / dataset_name / proper_ratio.strip()
-
-    if proper_ratio is not None:
-        LOGGER.warning(
-            "--proper-ratio was provided for non-gsm8k_proper dataset and will be ignored."
-        )
-
-    return splits_dir / dataset_name
 
 
 def parse_args() -> RLTrainConfig:

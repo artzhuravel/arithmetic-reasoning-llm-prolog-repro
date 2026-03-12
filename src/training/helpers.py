@@ -3,9 +3,14 @@ from __future__ import annotations
 import os
 from typing import Any, Protocol
 from transformers import AutoTokenizer
+from pathlib import Path
+
+from src.data.prepare_splits import get_default_splits_dir
 
 import torch
+import logging
 
+LOGGER = logging.getLogger(__name__)
 
 class TrainConfigLike(Protocol):
     @property
@@ -15,7 +20,35 @@ class TrainConfigLike(Protocol):
     @property
     def hf_token(self) -> str | None:
         ...
-    
+
+def _resolve_dataset_dir(
+    dataset_dir: Path | None = None,
+    splits_dir: Path | None = None,
+    dataset_name: str | None = None,
+    proper_ratio: str | None = None,
+) -> Path:
+    if dataset_dir is not None:
+        return dataset_dir
+
+    if dataset_name is None:
+        raise ValueError(
+            "Provide either --dataset-dir or --dataset-name "
+            "(gsm8k_prolog, openai_gsm8k, gsm8k_proper)."
+        )
+
+    splits_dir = splits_dir if splits_dir is not None else get_default_splits_dir()
+
+    if dataset_name == "gsm8k_proper":
+        if proper_ratio is None or not proper_ratio.strip():
+            raise ValueError("For gsm8k_proper, --proper-ratio is required.")
+        return splits_dir / dataset_name / proper_ratio.strip()
+
+    if proper_ratio is not None:
+        LOGGER.warning(
+            "--proper-ratio was provided for non-gsm8k_proper dataset and will be ignored."
+        )
+
+    return splits_dir / dataset_name
 
 
 def _resolve_torch_dtype(name: str) -> torch.dtype | str:

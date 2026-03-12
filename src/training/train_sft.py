@@ -24,6 +24,7 @@ from src.training.helpers import (
     _resolve_hf_token_from_cfg,
     _resolve_torch_dtype,
     build_tokenizer,
+    _resolve_dataset_dir,
 )
 
 from transformers import (
@@ -197,34 +198,6 @@ class LoraFineTuneStrategy:
 CallbackLike = TrainerCallback | Callable[
     [RunContext], TrainerCallback | Sequence[TrainerCallback]
 ]
-
-
-def _resolve_dataset_dir(
-    *,
-    dataset_dir: Path | None,
-    splits_dir: Path | None,
-    dataset_name: str | None,
-    proper_ratio: str | None,
-) -> Path:
-    if dataset_dir is not None:
-        return dataset_dir
-
-    if dataset_name is None:
-        raise ValueError(
-            "Provide either --dataset-dir or --dataset-name "
-            "(gsm8k_prolog, openai_gsm8k, gsm8k_proper)."
-        )
-
-    base_dir = splits_dir if splits_dir is not None else get_default_splits_dir()
-    if dataset_name == "gsm8k_proper":
-        if proper_ratio is None or not proper_ratio.strip():
-            raise ValueError("For gsm8k_proper, --proper-ratio is required.")
-        return base_dir / dataset_name / proper_ratio.strip()
-    if proper_ratio is not None:
-        LOGGER.warning(
-            "--proper-ratio was provided for non-gsm8k_proper dataset and will be ignored."
-        )
-    return base_dir / dataset_name
 
 
 def _safe_output_component(value: str) -> str:
@@ -770,6 +743,7 @@ def run(
     _configure_runtime_warning_filters()
     train_ds, eval_ds = load_training_splits(
         cfg.dataset_dir,
+        mode="sft",
         max_train_samples=cfg.max_train_samples,
         max_eval_samples=cfg.max_eval_samples,
     )
