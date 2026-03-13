@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 from pathlib import Path
@@ -160,6 +161,7 @@ def build_model(
         raise ValueError("adapter_dir requires attach_adapter=True.")
     if adapter_trainable and not attach_adapter:
         raise ValueError("adapter_trainable requires attach_adapter=True.")
+    resolved_adapter_dir = adapter_dir.resolve() if adapter_dir is not None else None
     if adapter_dir is not None and not adapter_dir.exists():
         raise FileNotFoundError(f"Adapter directory not found: {adapter_dir}")
     if attach_adapter and PeftModel is None:
@@ -185,11 +187,24 @@ def build_model(
     )
 
     if attach_adapter:
+        if resolved_adapter_dir is None:
+            raise ValueError("attach_adapter=True requires adapter_dir.")
+        adapter_config_path = resolved_adapter_dir / "adapter_config.json"
+        if not adapter_config_path.exists():
+            raise FileNotFoundError(f"Adapter config not found: {adapter_config_path}")
+        try:
+            json.loads(adapter_config_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"Invalid adapter config JSON at {adapter_config_path} "
+                f"(size={adapter_config_path.stat().st_size} bytes)."
+            ) from e
+
         peft_kwargs: dict[str, Any] = {}
         peft_kwargs = _maybe_add_hf_token(hf_token, peft_kwargs)
         model = cast(Any, PeftModel).from_pretrained(
             model,
-            str(adapter_dir),
+            str(resolved_adapter_dir),
             is_trainable=adapter_trainable,
             **peft_kwargs,
         )
