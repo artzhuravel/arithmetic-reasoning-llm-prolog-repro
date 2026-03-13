@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
@@ -43,6 +44,24 @@ _REWARD_SYNTAX_ERROR = -0.4
 _REWARD_EXECUTION_ERROR = -0.5
 _REWARD_TIMEOUT = -0.75
 _REWARD_EMPTY_COMPLETION = -1.0
+
+
+def _configure_runtime_warning_filters() -> None:
+    warnings.filterwarnings(
+        "ignore",
+        message=r"`get_control_token` is deprecated\. Use `get_special_token` instead\.",
+        category=FutureWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r"`_control_tokens` is deprecated\..*",
+        category=FutureWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Could not estimate the number of tokens of the input, floating-point operations will not be computed",
+        category=UserWarning,
+    )
 
 
 @dataclass(frozen=True)
@@ -343,6 +362,7 @@ def _build_validation_callback(
 
 
 def run(cfg: RLTrainConfig) -> None:
+    _configure_runtime_warning_filters()
     raw_ds = load_prepared_dataset(cfg.dataset_dir)
     train_ds, eval_ds = load_training_splits(
         cfg.dataset_dir,
