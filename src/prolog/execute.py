@@ -130,6 +130,20 @@ def _is_syntax_error(*texts: Optional[str]) -> bool:
     return False
 
 
+def _format_syntax_error_message(*texts: Optional[str]) -> str:
+    for t in texts:
+        if not t:
+            continue
+        lines = [line.strip() for line in t.splitlines() if line.strip()]
+        for line in lines:
+            low = line.lower()
+            if "syntax error" in low or "syntax_error" in low:
+                return line
+        if lines:
+            return lines[-1]
+    return "SWI-Prolog reported a syntax error."
+
+
 def _build_swipl_wrapper_goal(query_text: str, answer_var: str) -> str:
     query_no_dot = query_text[:-1].strip() if query_text.endswith(".") else query_text.strip()
     return (
@@ -241,11 +255,12 @@ def execute_prolog_string(
                 )
             if line.startswith("__EXCEPTION__="):
                 exc_text = line[len("__EXCEPTION__="):]
+                is_syntax_error = _is_syntax_error(stderr, exc_text)
                 return PrologExecutionResult(
                     ok=False,
                     query=query_text,
-                    error_type="syntax_error" if _is_syntax_error(stderr, exc_text) else "execution_error",
-                    error=exc_text,
+                    error_type="syntax_error" if is_syntax_error else "execution_error",
+                    error=_format_syntax_error_message(stderr, exc_text) if is_syntax_error else exc_text,
                     elapsed_ms=(perf_counter() - started) * 1000,
                     stdout=stdout,
                     stderr=stderr,
@@ -255,11 +270,12 @@ def execute_prolog_string(
         err_msg = "No result marker found in SWI-Prolog output."
         if proc.returncode != 0:
             err_msg = f"{err_msg} swipl exited with code {proc.returncode}."
+        is_syntax_error = _is_syntax_error(stderr, stdout)
         return PrologExecutionResult(
             ok=False,
             query=query_text,
-            error_type="syntax_error" if _is_syntax_error(stderr, stdout) else "execution_error",
-            error=err_msg,
+            error_type="syntax_error" if is_syntax_error else "execution_error",
+            error=_format_syntax_error_message(stderr, stdout, err_msg) if is_syntax_error else err_msg,
             elapsed_ms=(perf_counter() - started) * 1000,
             stdout=stdout,
             stderr=stderr,

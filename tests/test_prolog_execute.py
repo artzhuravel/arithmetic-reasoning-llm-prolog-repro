@@ -105,6 +105,8 @@ def test_syntax_error_classification() -> None:
     r = execute_solve(CODE_SYNTAX_ERROR)
     assert not r.ok
     assert r.error_type == "syntax_error"
+    assert r.error is not None
+    assert "Syntax error" in r.error
     assert r.stderr is not None
     assert "Syntax error" in r.stderr
 
