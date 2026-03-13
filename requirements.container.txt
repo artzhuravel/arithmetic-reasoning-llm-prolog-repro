@@ -1,0 +1,11 @@
+# Core (data, prolog)
+datasets
+pyswip
+
+# Training (SFT, LoRA, RL)
+accelerate
+bitsandbytes
+peft
+sentencepiece
+tqdm
+trl==0.27.2

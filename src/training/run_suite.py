@@ -8,16 +8,21 @@ import json
 import logging
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Mapping, Optional, cast
+from typing import Any, Mapping, cast
 
 from datasets import Dataset
 import torch
-from src.training.helpers import build_tokenizer, build_model
 
 from src.data.prepare_splits import get_default_splits_dir
-from src.prolog.execute import normalize_prolog_answer_for_eval
 from src.training.callbacks import score_predicted_prolog_batch, tqdm
-from src.training.data import PromptTemplate, build_prompt_text, load_prepared_dataset, resolve_prompt_template
+from src.training.data import (
+    PromptTemplate,
+    build_prompt_text,
+    load_ground_truth_map,
+    load_prepared_dataset,
+    resolve_prompt_template,
+)
+from src.training.helpers import _resolve_dataset_dir, build_model, build_tokenizer
 
 
 LOGGER = logging.getLogger(__name__)
@@ -53,15 +58,6 @@ class EvalConfig:
     hf_token: str | None
 
 
-@dataclass(frozen=True)
-class EvalModelConfig:
-    model_name_or_path: str
-    hf_token: str | None
-    torch_dtype: str
-    quantization: str | None
-    device_map: str | None
-
-
 TEST_SUITES: dict[str, TestSuiteSpec] = {
     "gsm8k_prolog_val": TestSuiteSpec(dataset_name="gsm8k_prolog", split_name="val"),
     "gsm8k_prolog_test": TestSuiteSpec(dataset_name="gsm8k_prolog", split_name="test"),
@@ -74,64 +70,11 @@ TEST_SUITES: dict[str, TestSuiteSpec] = {
     "openai_gsm8k_val": TestSuiteSpec(dataset_name="openai_gsm8k", split_name="val"),
     "openai_gsm8k_test": TestSuiteSpec(dataset_name="openai_gsm8k", split_name="test"),
 }
-
-
-def _normalize_ratio_dir_name(ratio: str) -> str:
-    clean = ratio.strip()
-    if not clean:
-        raise ValueError("proper_ratio must not be empty.")
-    if clean.startswith("ratio_"):
-        return clean
-    return f"ratio_{clean}"
-
-
-def _resolve_test_dataset_dir(
-    *,
-    splits_dir: Path,
-    test_suite: str,
-    proper_ratio: str,
-) -> tuple[Path, str]:
+def _resolve_test_suite_spec(test_suite: str) -> TestSuiteSpec:
     if test_suite not in TEST_SUITES:
         choices = ", ".join(sorted(TEST_SUITES.keys()))
         raise ValueError(f"Unknown test suite: {test_suite}. Choices: {choices}")
-
-    spec = TEST_SUITES[test_suite]
-    if spec.use_proper_ratio:
-        dataset_dir = (
-            splits_dir
-            / spec.dataset_name
-            / _normalize_ratio_dir_name(proper_ratio)
-        )
-    else:
-        dataset_dir = splits_dir / spec.dataset_name
-    return dataset_dir, spec.split_name
-
-
-def _load_ground_truth_map(dataset_dir: Path) -> dict[str, str]:
-    cur = dataset_dir.resolve()
-    gt_path: Path | None = None
-    for candidate_dir in (cur, *cur.parents):
-        candidate = candidate_dir / "ground_truth_by_prompt.json"
-        if candidate.exists():
-            gt_path = candidate
-            break
-
-    if gt_path is None:
-        raise FileNotFoundError(
-            "Could not locate ground_truth_by_prompt.json from "
-            f"path: {dataset_dir}"
-        )
-
-    payload = json.loads(gt_path.read_text(encoding="utf-8"))
-    raw_map = payload.get("all")
-    if not isinstance(raw_map, dict):
-        raise ValueError(
-            f"Invalid ground truth format in {gt_path}: expected top-level 'all' dict."
-        )
-    return {
-        str(k).strip(): normalize_prolog_answer_for_eval(v)
-        for k, v in raw_map.items()
-    }
+    return TEST_SUITES[test_suite]
 
 
 def _resolve_prompt_key(row: Mapping[str, Any]) -> str:
@@ -179,15 +122,18 @@ def _load_model_and_tokenizer(cfg: EvalConfig) -> tuple[Any, Any, str]:
             raise FileNotFoundError(f"Merged model directory not found: {cfg.merged_model_dir}")
 
         model_ref = str(cfg.merged_model_dir)
-        model_cfg = EvalModelConfig(
+        tokenizer = build_tokenizer(
+            model_name_or_path=model_ref,
+            hf_token=cfg.hf_token,
+            padding="left",
+        )
+        model = build_model(
             model_name_or_path=model_ref,
             hf_token=cfg.hf_token,
             torch_dtype=cfg.torch_dtype,
-            quantization=None,
+            quantization="none",
             device_map=cfg.device_map,
         )
-        tokenizer = build_tokenizer(model_cfg, padding="left")
-        model = build_model(model_cfg)
         return tokenizer, model, model_ref
 
     if cfg.model_mode == "vanilla":
@@ -195,15 +141,18 @@ def _load_model_and_tokenizer(cfg: EvalConfig) -> tuple[Any, Any, str]:
             raise ValueError("--base-model-name-or-path is required when --model-mode vanilla.")
 
         model_ref = cfg.base_model_name_or_path.strip()
-        model_cfg = EvalModelConfig(
+        tokenizer = build_tokenizer(
+            model_name_or_path=model_ref,
+            hf_token=cfg.hf_token,
+            padding="left",
+        )
+        model = build_model(
             model_name_or_path=model_ref,
             hf_token=cfg.hf_token,
             torch_dtype=cfg.torch_dtype,
-            quantization=None,
+            quantization="none",
             device_map=cfg.device_map,
         )
-        tokenizer = build_tokenizer(model_cfg, padding="left")
-        model = build_model(model_cfg)
         return tokenizer, model, model_ref
 
     if cfg.model_mode == "adapter":
@@ -212,25 +161,26 @@ def _load_model_and_tokenizer(cfg: EvalConfig) -> tuple[Any, Any, str]:
         if not cfg.adapter_dir.exists():
             raise FileNotFoundError(f"Adapter directory not found: {cfg.adapter_dir}")
 
-        base_model_ref = (
+        model_ref = (
             cfg.base_model_name_or_path.strip()
             if cfg.base_model_name_or_path is not None and cfg.base_model_name_or_path.strip()
             else _resolve_base_model_from_adapter(cfg.adapter_dir)
         )
-        model_cfg = EvalModelConfig(
-            model_name_or_path=base_model_ref,
+        tokenizer = build_tokenizer(
+            model_name_or_path=model_ref,
+            hf_token=cfg.hf_token,
+            padding="left",
+        )
+        model = build_model(
+            model_name_or_path=model_ref,
             hf_token=cfg.hf_token,
             torch_dtype=cfg.torch_dtype,
-            quantization=None,
+            quantization="none",
             device_map=cfg.device_map,
-        )
-        tokenizer = build_tokenizer(model_cfg, padding="left")
-        model = build_model(
-            model_cfg,
             attach_adapter=True,
             adapter_dir=cfg.adapter_dir,
         )
-        return tokenizer, model, f"{base_model_ref} + adapter:{cfg.adapter_dir}"
+        return tokenizer, model, f"{model_ref} + adapter:{cfg.adapter_dir}"
 
     raise ValueError(f"Unsupported model mode: {cfg.model_mode}")
 
@@ -264,9 +214,6 @@ def _generate_batch(
             pad_token_id=tokenizer.pad_token_id,
         )
 
-    # For decoder-only generation, returned sequences include the full padded
-    # input width. With left padding, slicing by attention_mask.sum would keep
-    # part of the prompt, so always slice by the input tensor width.
     input_len = int(inputs["input_ids"].shape[1])
     completions: list[str] = []
     for i in range(len(prompts)):
@@ -276,11 +223,13 @@ def _generate_batch(
 
 
 def run_evaluation(cfg: EvalConfig) -> dict[str, Any]:
-    dataset_dir, split_name = _resolve_test_dataset_dir(
+    spec = _resolve_test_suite_spec(cfg.test_suite)
+    dataset_dir = _resolve_dataset_dir(
         splits_dir=cfg.splits_dir,
-        test_suite=cfg.test_suite,
-        proper_ratio=cfg.proper_ratio,
+        dataset_name=spec.dataset_name,
+        proper_ratio=cfg.proper_ratio if spec.use_proper_ratio else None,
     )
+    split_name = spec.split_name
     if not dataset_dir.exists():
         raise FileNotFoundError(f"Dataset directory not found: {dataset_dir}")
 
@@ -296,8 +245,8 @@ def run_evaluation(cfg: EvalConfig) -> dict[str, Any]:
         split_ds = split_ds.select(range(min(cfg.max_samples, len(split_ds))))
 
     template: PromptTemplate = resolve_prompt_template(dataset_dir, split_ds)
-    ground_truth_by_prompt = _load_ground_truth_map(dataset_dir)
-    
+    ground_truth_by_prompt = load_ground_truth_map(dataset_dir)
+
     tokenizer, model, resolved_model_ref = _load_model_and_tokenizer(cfg)
     model.eval()
 
@@ -336,7 +285,7 @@ def run_evaluation(cfg: EvalConfig) -> dict[str, Any]:
                 batch_end = min(batch_start + cfg.generation_batch_size, total_rows)
                 batch_rows = [cast(dict[str, Any], split_ds[i]) for i in range(batch_start, batch_end)]
 
-                prompts: list[str] = [
+                prompts = [
                     build_prompt_text(row, template=template, include_output=False)
                     for row in batch_rows
                 ]
@@ -351,7 +300,7 @@ def run_evaluation(cfg: EvalConfig) -> dict[str, Any]:
 
                 prompt_keys: list[str] = []
                 expected_batch: list[str] = []
-                for local_idx, row in enumerate(batch_rows):
+                for row in batch_rows:
                     prompt_key = _resolve_prompt_key(row)
                     prompt_keys.append(prompt_key)
                     expected = ground_truth_by_prompt.get(prompt_key)
@@ -371,18 +320,13 @@ def run_evaluation(cfg: EvalConfig) -> dict[str, Any]:
 
                 for local_idx in range(len(batch_rows)):
                     global_idx = batch_start + local_idx
-                    prompt_key = prompt_keys[local_idx]
-                    expected = expected_batch[local_idx]
-                    model_input = prompts[local_idx]
-                    model_output = generated[local_idx]
                     exec_ok_inc, raw_correct_inc, exec_result = scored_batch[local_idx]
 
                     exec_ok_count += exec_ok_inc
-                    has_expected = bool(expected)
+                    has_expected = bool(expected_batch[local_idx])
                     correct_inc = raw_correct_inc if has_expected else 0
                     correct_count += correct_inc
                     correct_when_exec_ok_count += correct_inc
-                    is_correct = bool(correct_inc)
 
                     if trace_file is not None:
                         trace_record = {
@@ -390,15 +334,15 @@ def run_evaluation(cfg: EvalConfig) -> dict[str, Any]:
                             "suite": cfg.test_suite,
                             "dataset_dir": str(dataset_dir),
                             "split": split_name,
-                            "prompt_key": prompt_key,
-                            "model_input": model_input,
-                            "model_output": model_output,
-                            "expected_answer": expected,
+                            "prompt_key": prompt_keys[local_idx],
+                            "model_input": prompts[local_idx],
+                            "model_output": generated[local_idx],
+                            "expected_answer": expected_batch[local_idx],
                             "exec_ok": exec_result.ok,
                             "exec_error_type": exec_result.error_type,
                             "exec_error": exec_result.error,
                             "exec_normalized_answer": exec_result.normalized_answer,
-                            "is_correct": is_correct,
+                            "is_correct": bool(correct_inc),
                         }
                         trace_file.write(json.dumps(trace_record) + "\n")
     finally:
@@ -501,7 +445,6 @@ def parse_args() -> EvalConfig:
     parser.add_argument("--base-model-name-or-path", type=str, default=None)
     parser.add_argument("--adapter-dir", type=Path, default=None)
     parser.add_argument("--merged-model-dir", type=Path, default=None)
-
     parser.add_argument(
         "--test-suite",
         type=str,
@@ -522,7 +465,6 @@ def parse_args() -> EvalConfig:
     )
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--save-trace", action="store_true")
-
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--generation-batch-size", type=int, default=6)
     parser.add_argument(
@@ -564,7 +506,9 @@ def parse_args() -> EvalConfig:
     if args.max_samples is not None and args.max_samples <= 0:
         raise ValueError("--max-samples must be > 0 when provided.")
 
-    resolved_splits_dir = args.splits_dir if args.splits_dir is not None else get_default_splits_dir()
+    resolved_splits_dir = (
+        args.splits_dir if args.splits_dir is not None else get_default_splits_dir()
+    )
     resolved_output_dir = _build_output_dir(
         output_dir=args.output_dir,
         test_suite=args.test_suite,

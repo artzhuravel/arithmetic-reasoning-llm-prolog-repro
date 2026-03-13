@@ -2,7 +2,7 @@ from __future__ import annotations
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 import json
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Sequence, Tuple
 import warnings
 
 from src.prolog.execute import PrologExecutionResult, execute_solve
@@ -45,10 +45,7 @@ def _load_tqdm() -> Any:
 tqdm = _load_tqdm()
 
 
-def score_predicted_prolog(
-    pred_code: str,
-    expected: str,
-) -> tuple[int, int, PrologExecutionResult]:
+def score_predicted_prolog(scorable_item: tuple[str, str]) -> tuple[int, int, PrologExecutionResult]:
     """
     Execute predicted Prolog code and compare normalized answer to expected.
 
@@ -57,6 +54,7 @@ def score_predicted_prolog(
     - correct_inc: 1 when execution succeeded and answer matches expected else 0
     - result: full PrologExecutionResult
     """
+    pred_code, expected = scorable_item
     got = execute_solve(pred_code)
     if not got.ok:
         return 0, 0, got
@@ -78,18 +76,14 @@ def score_predicted_prolog_batch(
     if workers < 1:
         raise ValueError("workers must be >= 1")
 
-    def _score_item(item: tuple[str, str]) -> tuple[int, int, PrologExecutionResult]:
-        pred_code, expected = item
-        return score_predicted_prolog(pred_code, expected)
-
     if executor is not None:
-        return list(executor.map(_score_item, items))
+        return list(executor.map(score_predicted_prolog, items))
 
     if workers == 1:
-        return [_score_item(item) for item in items]
+        return [score_predicted_prolog(item) for item in items]
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        return list(executor.map(_score_item, items))
+        return list(executor.map(score_predicted_prolog, items))
 
 
 class PrologAccuracyCallback(TrainerCallback):
@@ -102,13 +96,17 @@ class PrologAccuracyCallback(TrainerCallback):
         template: PromptTemplate,
         max_samples: int = 100,
         eval_every_steps: int = 1,
+        eval_strategy: str = "steps",
         workers: int = 10,
         generation_batch_size: int = 8,
         generation_num_beams: int = 4,
         generation_max_new_tokens: int = 256,
+        prompt_max_length: int = 1024,
     ):
         if eval_every_steps < 1:
             raise ValueError("eval_every_steps must be >= 1")
+        if eval_strategy not in {"no", "steps", "epoch"}:
+            raise ValueError("eval_strategy must be one of: no, steps, epoch")
         if workers < 1:
             raise ValueError("workers must be >= 1")
         if generation_batch_size < 1:
@@ -117,6 +115,8 @@ class PrologAccuracyCallback(TrainerCallback):
             raise ValueError("generation_num_beams must be >= 1")
         if generation_max_new_tokens < 1:
             raise ValueError("generation_max_new_tokens must be >= 1")
+        if prompt_max_length < 1:
+            raise ValueError("prompt_max_length must be >= 1")
 
         self.tokenizer = tokenizer
         self.eval_rows = eval_rows
@@ -124,10 +124,12 @@ class PrologAccuracyCallback(TrainerCallback):
         self.template = template
         self.max_samples = max_samples
         self.eval_every_steps = eval_every_steps
+        self.eval_strategy = eval_strategy
         self.workers = workers
         self.generation_batch_size = generation_batch_size
         self.generation_num_beams = generation_num_beams
         self.generation_max_new_tokens = generation_max_new_tokens
+        self.prompt_max_length = prompt_max_length
         self.last_result: dict[str, Any] | None = None
         self.history: list[dict[str, Any]] = []
 
@@ -177,7 +179,12 @@ class PrologAccuracyCallback(TrainerCallback):
         global_step = int(state.global_step)
         max_steps = int(state.max_steps or 0)
         is_final_eval = max_steps > 0 and global_step >= max_steps
-        if global_step % self.eval_every_steps != 0 and not is_final_eval:
+        should_skip = (
+            self.eval_strategy == "steps"
+            and global_step % self.eval_every_steps != 0
+            and not is_final_eval
+        )
+        if should_skip:
             return control
 
         model.eval()
@@ -202,11 +209,6 @@ class PrologAccuracyCallback(TrainerCallback):
             self.generation_max_new_tokens,
         )
 
-        def _score_single(item: tuple[str, str]) -> tuple[int, int]:
-            pred_code, expected = item
-            exec_ok_inc, correct_inc, _ = score_predicted_prolog(pred_code, expected)
-            return exec_ok_inc, correct_inc
-
         exec_ok = 0
         correct = 0
         batch_size = self.generation_batch_size
@@ -230,7 +232,7 @@ class PrologAccuracyCallback(TrainerCallback):
                 leave=False,
                 disable=progress_disabled,
             ) as exec_pbar:
-                pending_scores: set[Future[tuple[int, int]]] = set()
+                pending_scores: set[Future[tuple[int, int, PrologExecutionResult]]] = set()
 
                 def _consume_done_scores(*, block: bool) -> None:
                     nonlocal exec_ok, correct, pending_scores
@@ -246,7 +248,7 @@ class PrologAccuracyCallback(TrainerCallback):
                         )
                     pending_scores = set(not_done)
                     for future in done:
-                        exec_ok_inc, correct_inc = future.result()
+                        exec_ok_inc, correct_inc, _ = future.result()
                         exec_ok += exec_ok_inc
                         correct += correct_inc
                         exec_pbar.update(1)
@@ -277,7 +279,7 @@ class PrologAccuracyCallback(TrainerCallback):
                         prompts,
                         return_tensors="pt",
                         truncation=True,
-                        max_length=1024,
+                        max_length=self.prompt_max_length,
                         padding=True,
                     )
                     inputs = {k: v.to(model.device) for k, v in inputs.items()}
@@ -315,15 +317,13 @@ class PrologAccuracyCallback(TrainerCallback):
                     gen_pbar.update(len(batch_preds))
 
                     if executor is None:
-                        for exec_ok_inc, correct_inc in map(_score_single, batch_preds):
+                        for exec_ok_inc, correct_inc, _ in map(score_predicted_prolog, batch_preds):
                             exec_ok += exec_ok_inc
                             correct += correct_inc
                             exec_pbar.update(1)
                     else:
                         for item in batch_preds:
-                            pending_scores.add(executor.submit(_score_single, item))
-                        # Do a non-blocking drain so Prolog execution overlaps
-                        # with subsequent generation batches.
+                            pending_scores.add(executor.submit(score_predicted_prolog, item))
                         _consume_done_scores(block=False)
 
                 _consume_done_scores(block=True)

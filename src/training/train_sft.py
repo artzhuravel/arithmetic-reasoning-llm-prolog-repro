@@ -20,9 +20,10 @@ from src.training.data import (
 from src.data.prepare_splits import get_default_splits_dir
 from src.training.callbacks import PrologAccuracyCallback
 from src.training.helpers import (
-    _maybe_add_hf_token_from_cfg,
+    _build_quantization_config,
     _resolve_hf_token_from_cfg,
     _resolve_torch_dtype,
+    build_model,
     build_tokenizer,
     _resolve_dataset_dir,
 )
@@ -30,7 +31,6 @@ from src.training.helpers import (
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    BitsAndBytesConfig,
     DataCollatorForLanguageModeling,
     Trainer,
     TrainerCallback,
@@ -136,14 +136,12 @@ class FullFineTuneStrategy:
             raise ValueError(
                 "Full fine-tuning strategy currently supports only --quantization none."
             )
-
-        model_kwargs: dict[str, Any] = {"dtype": _resolve_torch_dtype(cfg.torch_dtype)}
-        if cfg.device_map is not None:
-            model_kwargs["device_map"] = cfg.device_map
-        model_kwargs = _maybe_add_hf_token_from_cfg(cfg, model_kwargs)
-        return AutoModelForCausalLM.from_pretrained(
-            cfg.model_name_or_path,
-            **model_kwargs,
+        return build_model(
+            model_name_or_path=cfg.model_name_or_path,
+            torch_dtype=cfg.torch_dtype,
+            quantization=self.quantization,
+            device_map=cfg.device_map,
+            hf_token=_resolve_hf_token_from_cfg(cfg),
         )
 
 
@@ -166,16 +164,12 @@ class LoraFineTuneStrategy:
             quantization=self.lora.quantization,
             torch_dtype=cfg.torch_dtype,
         )
-        model_kwargs: dict[str, Any] = {"dtype": _resolve_torch_dtype(cfg.torch_dtype)}
-        if quant_config is not None:
-            model_kwargs["quantization_config"] = quant_config
-        if cfg.device_map is not None:
-            model_kwargs["device_map"] = cfg.device_map
-        model_kwargs = _maybe_add_hf_token_from_cfg(cfg, model_kwargs)
-
-        model = AutoModelForCausalLM.from_pretrained(
-            cfg.model_name_or_path,
-            **model_kwargs,
+        model = build_model(
+            model_name_or_path=cfg.model_name_or_path,
+            torch_dtype=cfg.torch_dtype,
+            quantization=self.lora.quantization,
+            device_map=cfg.device_map,
+            hf_token=_resolve_hf_token_from_cfg(cfg),
         )
 
         if quant_config is not None:
@@ -480,28 +474,7 @@ def parse_args() -> tuple[TrainConfig, ModelBuildStrategy]:
 
 
 
-def _build_quantization_config(
-    *,
-    quantization: str,
-    torch_dtype: str,
-) -> BitsAndBytesConfig | None:
-    if quantization == "none":
-        return None
-    if quantization == "8bit":
-        return BitsAndBytesConfig(load_in_8bit=True)
-    if quantization == "4bit":
-        compute_dtype = (
-            torch.bfloat16 if torch_dtype == "bfloat16" else torch.float16
-        )
-        return BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=compute_dtype,
-        )
-    raise ValueError(
-        f"Unsupported quantization '{quantization}'. Use one of: none, 8bit, 4bit."
-    )
+
 
 
 def merge_lora_adapter_into_base(
@@ -691,6 +664,8 @@ def _resolve_default_callbacks(context: RunContext) -> list[TrainerCallback]:
 
     try:
         eval_rows = resolve_eval_rows(context.raw_dataset)
+        if cfg.max_eval_samples is not None:
+            eval_rows = eval_rows.select(range(min(cfg.max_eval_samples, len(eval_rows))))
         template = resolve_prompt_template(cfg.dataset_dir, eval_rows)
         gt_map = load_ground_truth_map(cfg.dataset_dir)
     except Exception as e:
@@ -718,10 +693,12 @@ def _resolve_default_callbacks(context: RunContext) -> list[TrainerCallback]:
             template=template,
             max_samples=cfg.custom_callbacks.max_samples,
             eval_every_steps=cfg.custom_callbacks.eval_every_steps,
+            eval_strategy="steps",
             workers=CUSTOM_CALLBACKS_WORKERS,
             generation_batch_size=cfg.custom_callbacks.generation_batch_size,
             generation_num_beams=cfg.custom_callbacks.generation_num_beams,
             generation_max_new_tokens=cfg.custom_callbacks.generation_max_new_tokens,
+            prompt_max_length=cfg.max_seq_length,
         )
     ]
 
@@ -762,7 +739,11 @@ def run(
     else:
         LOGGER.info("HF token detected. Using authenticated Hugging Face Hub requests.")
 
-    tokenizer = build_tokenizer(cfg)
+    tokenizer = build_tokenizer(
+        model_name_or_path=cfg.model_name_or_path,
+        hf_token=_resolve_hf_token_from_cfg(cfg),
+        padding="right",
+    )
     model = cast(AutoModelForCausalLM, strategy.build_model(cfg))
     context = RunContext(cfg=cfg, tokenizer=tokenizer, raw_dataset=raw_ds)
     user_callbacks = _resolve_callbacks(callbacks, context=context)
@@ -776,6 +757,8 @@ def run(
         train_ds=train_ds,
         eval_ds=eval_ds,
         callbacks=resolved_callbacks,
+        eval_strategy="steps",
+        eval_steps=cfg.custom_callbacks.eval_every_steps,
     )
 
     train_result = trainer.train()
