@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import logging
 from pathlib import Path
-from typing import Any, Mapping, Optional, cast
+from typing import Any, Mapping, Optional, cast, Literal
+from src.prolog.execute import normalize_prolog_answer_for_eval
 
 from datasets import Dataset, DatasetDict, load_from_disk
 
@@ -191,7 +193,7 @@ def format_record_for_sft(
     return {"text": build_prompt_text(row, template=template, include_output=True)}
 
 
-def to_text_dataset(
+def to_sft_dataset(
     split: Dataset,
     *,
     template: Optional[PromptTemplate] = None,
@@ -213,10 +215,115 @@ def to_text_dataset(
         remove_columns=split.column_names,
         desc="Formatting SFT text",
     )
+    
+    
+def format_record_for_rl(
+    row: dict[str, Any],
+    *,
+    template: PromptTemplate,
+    gt_map: dict[str, str],
+) -> dict[str, str]:
+    """
+    Build a single training text field from one of:
+    - Prolog-style rows: instruction/input/output
+    - OpenAI GSM8K rows: question/answer (with a default instruction)
+    """
+    prompt_key  = (
+        str(row["input"]).strip()
+        if "input" in row
+        else str(row.get("question", "")).strip()
+    )
+    try:
+        expected_answer = gt_map[prompt_key]
+    except KeyError as e:
+        raise ValueError(f"Missing ground truth for prompt: {prompt_key[:120]!r}") from e
+    if not expected_answer:
+        raise ValueError(f"Ground truth is empty for prompt: {prompt_key[:120]!r}")
+    
+    return {
+        "prompt": build_prompt_text(row, template=template, include_output=False),
+        "prompt_key": prompt_key,
+        "expected_answer": str(expected_answer),
+    }
+    
+
+def to_rl_dataset(
+    split: Dataset,
+    *,
+    template: PromptTemplate,
+    gt_map: dict[str, str],
+) -> Dataset:
+    """
+    Convert split rows into a plain text field consumed by RL.
+    """
+    columns = set(split.column_names)
+    resolved_template = template or _resolve_template_from_columns(columns)
+    
+    return split.map(
+        lambda row: format_record_for_rl(row, template=resolved_template, gt_map=gt_map),
+        remove_columns=split.column_names,
+        desc="Formatting RL text",
+    )
+
+def preview_formatted_examples(train_ds: Any, eval_ds: Any, *, n: int = 1) -> None:
+    print(f"[data] train rows: {len(train_ds)}")
+    print(f"[data] eval rows:  {len(eval_ds)}")
+    preview_field = (
+        "text"
+        if "text" in train_ds.column_names
+        else "prompt"
+        if "prompt" in train_ds.column_names
+        else None
+    )
+    for i in range(min(n, len(train_ds))):
+        print(f"\n[data] train sample #{i}")
+        if preview_field is None:
+            print(train_ds[i])
+        else:
+            print(str(train_ds[i][preview_field])[:800])
+
+    
+def load_ground_truth_map(dataset_dir: Path) -> dict[str, str]:
+    """
+    Load normalized ground-truth answers for any prepared dataset path in this repo.
+
+    Works for:
+    - .../gsm8k_proper/ratio_*/
+    - .../gsm8k_prolog/
+    - .../openai_gsm8k/
+    - and nested split directories such as .../gsm8k_prolog/train
+    """
+    cur = dataset_dir.resolve()
+    gt_path: Path | None = None
+    for candidate_dir in (cur, *cur.parents):
+        candidate = candidate_dir / "ground_truth_by_prompt.json"
+        if candidate.exists():
+            gt_path = candidate
+            break
+
+    if gt_path is None:
+        raise FileNotFoundError(
+            "Could not locate ground_truth_by_prompt.json from "
+            f"path: {dataset_dir}"
+        )
+
+    payload = json.loads(gt_path.read_text(encoding="utf-8"))
+    return {k.strip(): normalize_prolog_answer_for_eval(v) for k, v in payload["all"].items()}
+
+
+def resolve_eval_rows(raw_ds: DatasetDict) -> Dataset:
+    if "val" in raw_ds:
+        return cast(Dataset, raw_ds["val"])
+    available = ", ".join(str(k) for k in raw_ds.keys())
+    raise KeyError(
+        "Could not infer eval split for callback rows. Strict policy requires 'val'. "
+        f"Available splits: [{available}]"
+    )
 
 
 def load_training_splits(
     dataset_dir: Path,
+    mode: Literal["sft", "rl"],
     *,
     max_train_samples: Optional[int] = None,
     max_eval_samples: Optional[int] = None
@@ -225,31 +332,9 @@ def load_training_splits(
     Load + format train/eval splits and apply optional row caps.
     """
     ds = load_prepared_dataset(dataset_dir)
-    
-    if "train" not in ds:
-        available = ", ".join(str(k) for k in ds.keys())
-        raise KeyError(
-            "Could not infer train split. Strict policy requires a 'train' split. "
-            f"Available splits: [{available}]"
-        )
-    resolved_train_split = "train"
 
-    if "val" not in ds:
-        available = ", ".join(str(k) for k in ds.keys())
-        raise KeyError(
-            "Could not infer eval split. Strict policy requires a 'val' split. "
-            f"Available splits: [{available}]"
-        )
-    resolved_eval_split = "val"
-
-    LOGGER.info(
-        "Strict split policy active: using train='%s' and eval='%s'.",
-        resolved_train_split,
-        resolved_eval_split,
-    )
-
-    train_ds = cast(Dataset, ds[resolved_train_split])
-    eval_ds = cast(Dataset, ds[resolved_eval_split])
+    train_ds = cast(Dataset, ds["train"])
+    eval_ds = cast(Dataset, ds["val"])
 
     if max_train_samples is not None:
         train_ds = train_ds.select(range(min(max_train_samples, len(train_ds))))
@@ -264,7 +349,15 @@ def load_training_splits(
         resolved_template.input_header,
         resolved_template.output_header,
     )
+    
+    if mode == "sft":
+        train_text = to_sft_dataset(train_ds, template=resolved_template)
+        eval_text = to_sft_dataset(eval_ds, template=resolved_template)
+    elif mode == "rl":
+        gt_map = load_ground_truth_map(dataset_dir)
+        train_text = to_rl_dataset(train_ds, template=resolved_template, gt_map=gt_map)
+        eval_text = to_rl_dataset(eval_ds, template=resolved_template, gt_map=gt_map)
+    else:
+        raise ValueError(f"Unsupported mode: {mode}")
 
-    train_text = to_text_dataset(train_ds, template=resolved_template)
-    eval_text = to_text_dataset(eval_ds, template=resolved_template)
     return train_text, eval_text

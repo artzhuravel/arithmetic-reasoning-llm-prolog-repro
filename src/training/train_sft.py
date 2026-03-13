@@ -1,7 +1,6 @@
 from __future__ import annotations
 import json
 import logging
-import os
 import warnings
 from datetime import datetime
 
@@ -13,16 +12,25 @@ from typing import Any, Callable, Protocol, Sequence, cast
 from src.training.data import (
     load_prepared_dataset,
     load_training_splits,
+    preview_formatted_examples,
     resolve_prompt_template,
+    load_ground_truth_map,
+    resolve_eval_rows,
 )
 from src.data.prepare_splits import get_default_splits_dir
 from src.training.callbacks import PrologAccuracyCallback
-from src.prolog.execute import normalize_prolog_answer_for_eval
+from src.training.helpers import (
+    _build_quantization_config,
+    _resolve_hf_token_from_cfg,
+    _resolve_torch_dtype,
+    build_model,
+    build_tokenizer,
+    _resolve_dataset_dir,
+)
 
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    BitsAndBytesConfig,
     DataCollatorForLanguageModeling,
     Trainer,
     TrainerCallback,
@@ -59,33 +67,6 @@ def _configure_runtime_warning_filters() -> None:
         ),
         category=UserWarning,
     )
-
-def load_ground_truth_map(dataset_dir: Path) -> dict[str, str]:
-    """
-    Load normalized ground-truth answers for any prepared dataset path in this repo.
-
-    Works for:
-    - .../gsm8k_proper/ratio_*/
-    - .../gsm8k_prolog/
-    - .../openai_gsm8k/
-    - and nested split directories such as .../gsm8k_prolog/train
-    """
-    cur = dataset_dir.resolve()
-    gt_path: Path | None = None
-    for candidate_dir in (cur, *cur.parents):
-        candidate = candidate_dir / "ground_truth_by_prompt.json"
-        if candidate.exists():
-            gt_path = candidate
-            break
-
-    if gt_path is None:
-        raise FileNotFoundError(
-            "Could not locate ground_truth_by_prompt.json from "
-            f"path: {dataset_dir}"
-        )
-
-    payload = json.loads(gt_path.read_text(encoding="utf-8"))
-    return {k.strip(): normalize_prolog_answer_for_eval(v) for k, v in payload["all"].items()}
 
 
 @dataclass(frozen=True)
@@ -155,14 +136,12 @@ class FullFineTuneStrategy:
             raise ValueError(
                 "Full fine-tuning strategy currently supports only --quantization none."
             )
-
-        model_kwargs: dict[str, Any] = {"dtype": _resolve_torch_dtype(cfg.torch_dtype)}
-        if cfg.device_map is not None:
-            model_kwargs["device_map"] = cfg.device_map
-        model_kwargs = _maybe_add_hf_token(cfg, model_kwargs)
-        return AutoModelForCausalLM.from_pretrained(
-            cfg.model_name_or_path,
-            **model_kwargs,
+        return build_model(
+            model_name_or_path=cfg.model_name_or_path,
+            torch_dtype=cfg.torch_dtype,
+            quantization=self.quantization,
+            device_map=cfg.device_map,
+            hf_token=_resolve_hf_token_from_cfg(cfg),
         )
 
 
@@ -185,16 +164,12 @@ class LoraFineTuneStrategy:
             quantization=self.lora.quantization,
             torch_dtype=cfg.torch_dtype,
         )
-        model_kwargs: dict[str, Any] = {"dtype": _resolve_torch_dtype(cfg.torch_dtype)}
-        if quant_config is not None:
-            model_kwargs["quantization_config"] = quant_config
-        if cfg.device_map is not None:
-            model_kwargs["device_map"] = cfg.device_map
-        model_kwargs = _maybe_add_hf_token(cfg, model_kwargs)
-
-        model = AutoModelForCausalLM.from_pretrained(
-            cfg.model_name_or_path,
-            **model_kwargs,
+        model = build_model(
+            model_name_or_path=cfg.model_name_or_path,
+            torch_dtype=cfg.torch_dtype,
+            quantization=self.lora.quantization,
+            device_map=cfg.device_map,
+            hf_token=_resolve_hf_token_from_cfg(cfg),
         )
 
         if quant_config is not None:
@@ -219,37 +194,6 @@ CallbackLike = TrainerCallback | Callable[
 ]
 
 
-def _normalize_ratio_dir_name(ratio: str) -> str:
-    ratio = ratio.strip()
-    if not ratio:
-        raise ValueError("proper_ratio must not be empty.")
-    if ratio.startswith("ratio_"):
-        return ratio
-    return f"ratio_{ratio}"
-
-
-def _resolve_dataset_dir(
-    *,
-    dataset_dir: Path | None,
-    splits_dir: Path | None,
-    dataset_name: str | None,
-    proper_ratio: str,
-) -> Path:
-    if dataset_dir is not None:
-        return dataset_dir
-
-    if dataset_name is None:
-        raise ValueError(
-            "Provide either --dataset-dir or --dataset-name "
-            "(gsm8k_prolog, openai_gsm8k, gsm8k_proper)."
-        )
-
-    base_dir = splits_dir if splits_dir is not None else get_default_splits_dir()
-    if dataset_name == "gsm8k_proper":
-        return base_dir / dataset_name / _normalize_ratio_dir_name(proper_ratio)
-    return base_dir / dataset_name
-
-
 def _safe_output_component(value: str) -> str:
     cleaned = "".join(
         ch if (ch.isalnum() or ch in {"_", "-", "."}) else "_"
@@ -262,15 +206,16 @@ def _infer_dataset_slug(
     *,
     dataset_name: str | None,
     dataset_dir: Path,
-    proper_ratio: str,
+    proper_ratio: str | None,
 ) -> str:
     if dataset_name == "gsm8k_prolog":
         return "gsm8k_prolog"
     if dataset_name == "openai_gsm8k":
         return "openai_gsm8k"
     if dataset_name == "gsm8k_proper":
-        ratio = _normalize_ratio_dir_name(proper_ratio)
-        return f"gsm8k_proper_{ratio}"
+        if proper_ratio is None or not proper_ratio.strip():
+            raise ValueError("For gsm8k_proper, --proper-ratio is required.")
+        return f"gsm8k_proper_{_safe_output_component(proper_ratio.strip())}"
 
     lowered_parts = [part.lower() for part in dataset_dir.parts]
     if "gsm8k_prolog" in lowered_parts:
@@ -292,7 +237,7 @@ def _resolve_output_dir(
     output_dir: Path | None,
     dataset_name: str | None,
     dataset_dir: Path,
-    proper_ratio: str,
+    proper_ratio: str | None,
 ) -> Path:
     if output_dir is not None:
         return output_dir
@@ -338,8 +283,11 @@ def parse_args() -> tuple[TrainConfig, ModelBuildStrategy]:
     parser.add_argument(
         "--proper-ratio",
         type=str,
-        default="1to2",
-        help='Used with --dataset-name gsm8k_proper. Accepts "1to2" or "ratio_1to2".',
+        default=None,
+        help=(
+            "Used with --dataset-name gsm8k_proper. Must match the exact split "
+            'subdir (e.g. "ratio_1to2").'
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -520,82 +468,13 @@ def parse_args() -> tuple[TrainConfig, ModelBuildStrategy]:
     return cfg, strategy
 
 
-def preview_formatted_examples(train_ds: Any, eval_ds: Any, *, n: int = 1) -> None:
-    print(f"[data] train rows: {len(train_ds)}")
-    print(f"[data] eval rows:  {len(eval_ds)}")
-    for i in range(min(n, len(train_ds))):
-        print(f"\n[data] train sample #{i}")
-        print(train_ds[i]["text"][:800])
 
 
-def build_tokenizer(cfg: TrainConfig) -> Any:
-    tokenizer_kwargs: dict[str, Any] = {"use_fast": True}
-    tokenizer_kwargs = _maybe_add_hf_token(cfg, tokenizer_kwargs)
-    tokenizer = AutoTokenizer.from_pretrained(
-        cfg.model_name_or_path,
-        **tokenizer_kwargs,
-    )
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right"
-    
-    return tokenizer
 
 
-def _resolve_hf_token(cfg: TrainConfig) -> str | None:
-    if cfg.hf_token is not None and cfg.hf_token.strip():
-        return cfg.hf_token.strip()
-
-    for env_name in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACEHUB_API_TOKEN"):
-        value = os.getenv(env_name)
-        if value is not None and value.strip():
-            return value.strip()
-    return None
 
 
-def _maybe_add_hf_token(cfg: TrainConfig, kwargs: dict[str, Any]) -> dict[str, Any]:
-    token = _resolve_hf_token(cfg)
-    if token is not None:
-        kwargs["token"] = token
-    return kwargs
 
-
-def _resolve_torch_dtype(name: str) -> torch.dtype | str:
-    if name == "auto":
-        return "auto"
-    if name == "bfloat16":
-        return torch.bfloat16
-    if name == "float16":
-        return torch.float16
-    if name == "float32":
-        return torch.float32
-    raise ValueError(
-        f"Unsupported torch dtype '{name}'. Use one of: auto, bfloat16, float16, float32."
-    )
-
-
-def _build_quantization_config(
-    *,
-    quantization: str,
-    torch_dtype: str,
-) -> BitsAndBytesConfig | None:
-    if quantization == "none":
-        return None
-    if quantization == "8bit":
-        return BitsAndBytesConfig(load_in_8bit=True)
-    if quantization == "4bit":
-        compute_dtype = (
-            torch.bfloat16 if torch_dtype == "bfloat16" else torch.float16
-        )
-        return BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=compute_dtype,
-        )
-    raise ValueError(
-        f"Unsupported quantization '{quantization}'. Use one of: none, 8bit, 4bit."
-    )
 
 
 def merge_lora_adapter_into_base(
@@ -771,17 +650,6 @@ def _is_prolog_like_dataset(dataset_dir: Path) -> bool:
     return False
 
 
-def _resolve_eval_rows(raw_ds: DatasetDict) -> Dataset:
-    if "val" in raw_ds:
-        LOGGER.info("Strict split policy active for callback rows: using eval split 'val'.")
-        return cast(Dataset, raw_ds["val"])
-    available = ", ".join(str(k) for k in raw_ds.keys())
-    raise KeyError(
-        "Could not infer eval split for callback rows. Strict policy requires 'val'. "
-        f"Available splits: [{available}]"
-    )
-
-
 def _resolve_default_callbacks(context: RunContext) -> list[TrainerCallback]:
     cfg = context.cfg
     if not cfg.custom_callbacks.enabled:
@@ -795,7 +663,9 @@ def _resolve_default_callbacks(context: RunContext) -> list[TrainerCallback]:
         return []
 
     try:
-        eval_rows = _resolve_eval_rows(context.raw_dataset)
+        eval_rows = resolve_eval_rows(context.raw_dataset)
+        if cfg.max_eval_samples is not None:
+            eval_rows = eval_rows.select(range(min(cfg.max_eval_samples, len(eval_rows))))
         template = resolve_prompt_template(cfg.dataset_dir, eval_rows)
         gt_map = load_ground_truth_map(cfg.dataset_dir)
     except Exception as e:
@@ -823,10 +693,12 @@ def _resolve_default_callbacks(context: RunContext) -> list[TrainerCallback]:
             template=template,
             max_samples=cfg.custom_callbacks.max_samples,
             eval_every_steps=cfg.custom_callbacks.eval_every_steps,
+            eval_strategy="steps",
             workers=CUSTOM_CALLBACKS_WORKERS,
             generation_batch_size=cfg.custom_callbacks.generation_batch_size,
             generation_num_beams=cfg.custom_callbacks.generation_num_beams,
             generation_max_new_tokens=cfg.custom_callbacks.generation_max_new_tokens,
+            prompt_max_length=cfg.max_seq_length,
         )
     ]
 
@@ -848,6 +720,7 @@ def run(
     _configure_runtime_warning_filters()
     train_ds, eval_ds = load_training_splits(
         cfg.dataset_dir,
+        mode="sft",
         max_train_samples=cfg.max_train_samples,
         max_eval_samples=cfg.max_eval_samples,
     )
@@ -859,14 +732,18 @@ def run(
 
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     LOGGER.info("Training outputs directory: %s", cfg.output_dir)
-    if _resolve_hf_token(cfg) is None:
+    if _resolve_hf_token_from_cfg(cfg) is None:
         LOGGER.warning(
             "HF token not detected. Downloads will be unauthenticated and may be rate-limited."
         )
     else:
         LOGGER.info("HF token detected. Using authenticated Hugging Face Hub requests.")
 
-    tokenizer = build_tokenizer(cfg)
+    tokenizer = build_tokenizer(
+        model_name_or_path=cfg.model_name_or_path,
+        hf_token=_resolve_hf_token_from_cfg(cfg),
+        padding="right",
+    )
     model = cast(AutoModelForCausalLM, strategy.build_model(cfg))
     context = RunContext(cfg=cfg, tokenizer=tokenizer, raw_dataset=raw_ds)
     user_callbacks = _resolve_callbacks(callbacks, context=context)
@@ -880,6 +757,8 @@ def run(
         train_ds=train_ds,
         eval_ds=eval_ds,
         callbacks=resolved_callbacks,
+        eval_strategy="steps",
+        eval_steps=cfg.custom_callbacks.eval_every_steps,
     )
 
     train_result = trainer.train()
@@ -908,7 +787,7 @@ def run(
                 base_model_name_or_path=cfg.model_name_or_path,
                 torch_dtype=cfg.torch_dtype,
                 device_map=cfg.device_map,
-                hf_token=_resolve_hf_token(cfg),
+                hf_token=_resolve_hf_token_from_cfg(cfg),
             )
         else:
             LOGGER.warning(

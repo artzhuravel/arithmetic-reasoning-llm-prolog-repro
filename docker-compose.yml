@@ -10,8 +10,12 @@ services:
       - hf-cache:/workspace/.cache/huggingface
     environment:
       TOKENIZERS_PARALLELISM: "false"
+      HF_TOKEN: "${HF_TOKEN:-}"
+      HUGGING_FACE_HUB_TOKEN: "${HUGGING_FACE_HUB_TOKEN:-}"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+      VLLM_ENABLE_CUDA_COMPATIBILITY: "1"
     gpus: all
-    shm_size: "16gb"
+    ipc: host
     stdin_open: true
     tty: true
     command: bash
