@@ -106,7 +106,7 @@ def build_tokenizer(
     hf_token: str | None = None,
     padding: str = "right",
 ) -> Any:
-    tokenizer_kwargs: dict[str, Any] = {"use_fast": True}
+    tokenizer_kwargs: dict[str, Any] = {}
     tokenizer_kwargs = _maybe_add_hf_token(hf_token, tokenizer_kwargs)
     tokenizer = AutoTokenizer.from_pretrained(
         model_name_or_path,
