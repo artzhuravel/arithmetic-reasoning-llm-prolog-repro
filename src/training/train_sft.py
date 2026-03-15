@@ -564,8 +564,8 @@ def build_trainer(cfg: TrainConfig,
                   callbacks: Sequence[TrainerCallback] | None = None,
                   eval_strategy: str = "steps",
                   eval_steps: int = 20,
-                  save_steps: int = 200,
-                  save_strategy: str = "best",
+                  save_steps: int | None = None,
+                  save_strategy: str = "steps",
                   save_total_limit: int = 2,
                   load_best_model_at_end: bool = True,
                   metric_for_best_model: str = "eval_loss",
@@ -586,6 +586,8 @@ def build_trainer(cfg: TrainConfig,
         remove_columns=eval_ds.column_names,
     )
 
+    resolved_save_steps = eval_steps if save_steps is None else save_steps
+
     training_args = TrainingArguments(
         output_dir=str(cfg.output_dir),
         eval_strategy=eval_strategy,
@@ -598,7 +600,7 @@ def build_trainer(cfg: TrainConfig,
         gradient_accumulation_steps=cfg.gradient_accumulation_steps,
         num_train_epochs=cfg.num_train_epochs,
         save_strategy=save_strategy,
-        save_steps=save_steps,
+        save_steps=resolved_save_steps,
         save_total_limit=save_total_limit,
         load_best_model_at_end=load_best_model_at_end,
         metric_for_best_model=metric_for_best_model,
