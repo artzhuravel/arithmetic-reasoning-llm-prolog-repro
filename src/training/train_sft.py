@@ -71,7 +71,7 @@ def _configure_runtime_warning_filters() -> None:
 
 @dataclass(frozen=True)
 class CustomCallbacksConfig:
-    enabled: bool = True
+    enabled: bool = False
     max_samples: int = 100
     eval_every_steps: int = 50
     generation_batch_size: int = 7
@@ -92,6 +92,7 @@ class TrainConfig:
     per_device_train_batch_size: int = 2
     per_device_eval_batch_size: int = 2
     gradient_accumulation_steps: int = 8
+    eval_steps: int = 50
     max_seq_length: int = 1024
     custom_callbacks: CustomCallbacksConfig = field(
         default_factory=CustomCallbacksConfig
@@ -318,6 +319,7 @@ def parse_args() -> tuple[TrainConfig, ModelBuildStrategy]:
     parser.add_argument("--per-device-train-batch-size", type=int, default=2)
     parser.add_argument("--per-device-eval-batch-size", type=int, default=2)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
+    parser.add_argument("--eval-steps", type=int, default=50)
     parser.add_argument("--max-seq-length", type=int, default=1024)
     parser.add_argument(
         "--training-strategy",
@@ -351,7 +353,7 @@ def parse_args() -> tuple[TrainConfig, ModelBuildStrategy]:
         dest="enable_custom_callbacks",
         action="store_false",
     )
-    parser.set_defaults(enable_custom_callbacks=True)
+    parser.set_defaults(enable_custom_callbacks=False)
     parser.add_argument("--custom-callbacks-max-samples", type=int, default=100)
     parser.add_argument("--custom-callbacks-eval-every-steps", type=int, default=50)
     parser.add_argument(
@@ -411,6 +413,10 @@ def parse_args() -> tuple[TrainConfig, ModelBuildStrategy]:
         raise ValueError(
             'Full fine-tuning currently requires "--quantization none".'
         )
+    if args.eval_steps < 1:
+        raise ValueError("--eval-steps must be >= 1.")
+    if args.custom_callbacks_eval_every_steps < 1:
+        raise ValueError("--custom-callbacks-eval-every-steps must be >= 1.")
 
     resolved_dataset_dir = _resolve_dataset_dir(
         dataset_dir=args.dataset_dir,
@@ -437,6 +443,7 @@ def parse_args() -> tuple[TrainConfig, ModelBuildStrategy]:
         per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_eval_batch_size=args.per_device_eval_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
+        eval_steps=args.eval_steps,
         max_seq_length=args.max_seq_length,
         custom_callbacks=CustomCallbacksConfig(
             enabled=args.enable_custom_callbacks,
@@ -557,7 +564,7 @@ def build_trainer(cfg: TrainConfig,
                   callbacks: Sequence[TrainerCallback] | None = None,
                   eval_strategy: str = "steps",
                   eval_steps: int = 20,
-                  save_steps: int = 200,
+                  save_steps: int | None = None,
                   save_strategy: str = "steps",
                   save_total_limit: int = 2,
                   load_best_model_at_end: bool = True,
@@ -579,6 +586,8 @@ def build_trainer(cfg: TrainConfig,
         remove_columns=eval_ds.column_names,
     )
 
+    resolved_save_steps = eval_steps if save_steps is None else save_steps
+
     training_args = TrainingArguments(
         output_dir=str(cfg.output_dir),
         eval_strategy=eval_strategy,
@@ -591,7 +600,7 @@ def build_trainer(cfg: TrainConfig,
         gradient_accumulation_steps=cfg.gradient_accumulation_steps,
         num_train_epochs=cfg.num_train_epochs,
         save_strategy=save_strategy,
-        save_steps=save_steps,
+        save_steps=resolved_save_steps,
         save_total_limit=save_total_limit,
         load_best_model_at_end=load_best_model_at_end,
         metric_for_best_model=metric_for_best_model,
@@ -758,7 +767,7 @@ def run(
         eval_ds=eval_ds,
         callbacks=resolved_callbacks,
         eval_strategy="steps",
-        eval_steps=cfg.custom_callbacks.eval_every_steps,
+        eval_steps=cfg.eval_steps,
     )
 
     train_result = trainer.train()

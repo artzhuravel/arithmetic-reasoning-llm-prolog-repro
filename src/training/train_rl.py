@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
@@ -37,12 +38,30 @@ _PROMPT_INPUT_RE = re.compile(r"### Input\n(.*?)\n\n### Output\n", re.DOTALL)
 
 # Reward scaffold for Prolog execution outcomes. Tune these after a few runs.
 _REWARD_CORRECT = 1.0
-_REWARD_EXECUTABLE_WRONG = 0.1
-_REWARD_NO_SOLUTION = -0.2
-_REWARD_SYNTAX_ERROR = -0.4
-_REWARD_EXECUTION_ERROR = -0.5
-_REWARD_TIMEOUT = -0.75
+_REWARD_EXECUTABLE_WRONG = 0.0
+_REWARD_NO_SOLUTION = -0.25
+_REWARD_SYNTAX_ERROR = -0.6
+_REWARD_EXECUTION_ERROR = -0.6
+_REWARD_TIMEOUT = -1.0
 _REWARD_EMPTY_COMPLETION = -1.0
+
+
+def _configure_runtime_warning_filters() -> None:
+    warnings.filterwarnings(
+        "ignore",
+        message=r"`get_control_token` is deprecated\. Use `get_special_token` instead\.",
+        category=FutureWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r"`_control_tokens` is deprecated\..*",
+        category=FutureWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Could not estimate the number of tokens of the input, floating-point operations will not be computed",
+        category=UserWarning,
+    )
 
 
 @dataclass(frozen=True)
@@ -73,6 +92,7 @@ class RLTrainConfig:
     validation_generation_max_new_tokens: int = 256
     reward: str = "prolog_shaped_reward"
     reward_workers: int = 10
+    vllm_gpu_memory_utilization: float = 0.7
     torch_dtype: str = "bfloat16"
     device_map: str | None = "auto"
     hf_token: str | None = None
@@ -176,6 +196,8 @@ def _validate_grpo_config(cfg: RLTrainConfig) -> int:
         raise ValueError("validation_generation_max_new_tokens must be >= 1.")
     if cfg.reward_workers < 1:
         raise ValueError("reward_workers must be >= 1.")
+    if not (0.0 < cfg.vllm_gpu_memory_utilization < 1.0):
+        raise ValueError("vllm_gpu_memory_utilization must be between 0 and 1.")
 
     steps_per_generation = _resolve_steps_per_generation(cfg)
     generation_batch_size = cfg.per_device_train_batch_size * steps_per_generation
@@ -340,6 +362,7 @@ def _build_validation_callback(
 
 
 def run(cfg: RLTrainConfig) -> None:
+    _configure_runtime_warning_filters()
     raw_ds = load_prepared_dataset(cfg.dataset_dir)
     train_ds, eval_ds = load_training_splits(
         cfg.dataset_dir,
@@ -429,7 +452,7 @@ def run(cfg: RLTrainConfig) -> None:
         steps_per_generation=steps_per_generation,
         use_vllm=True,
         vllm_mode="colocate",
-        vllm_gpu_memory_utilization=0.9,
+        vllm_gpu_memory_utilization=cfg.vllm_gpu_memory_utilization,
         vllm_tensor_parallel_size=1,
         vllm_enable_sleep_mode=False,
     )
@@ -515,6 +538,7 @@ def parse_args() -> RLTrainConfig:
     parser.add_argument("--validation-generation-num-beams", type=int, default=4)
     parser.add_argument("--validation-generation-max-new-tokens", type=int, default=256)
     parser.add_argument("--reward-workers", type=int, default=10)
+    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.7)
     parser.add_argument("--torch-dtype", type=str, default="bfloat16")
     parser.add_argument("--device-map", type=str, default="auto")
     parser.add_argument("--hf-token", type=str, required=False)
@@ -564,6 +588,7 @@ def parse_args() -> RLTrainConfig:
         validation_generation_num_beams=args.validation_generation_num_beams,
         validation_generation_max_new_tokens=args.validation_generation_max_new_tokens,
         reward_workers=args.reward_workers,
+        vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
         torch_dtype=args.torch_dtype,
         device_map=resolved_device_map,
         hf_token=args.hf_token,

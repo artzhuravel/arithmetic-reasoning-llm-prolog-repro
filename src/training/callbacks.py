@@ -1,4 +1,5 @@
 from __future__ import annotations
+from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 import json
 from pathlib import Path
@@ -43,6 +44,43 @@ def _load_tqdm() -> Any:
 
 
 tqdm = _load_tqdm()
+
+_KNOWN_EXECUTION_OUTCOMES: tuple[str, ...] = (
+    "ok",
+    "no_solution",
+    "syntax_error",
+    "execution_error",
+    "timeout",
+    "dependency_error",
+    "unknown_error",
+)
+
+
+def _resolve_execution_outcome_name(result: PrologExecutionResult) -> str:
+    if result.ok:
+        return "ok"
+    if result.error_type is None or not result.error_type.strip():
+        return "unknown_error"
+    return result.error_type.strip()
+
+
+def _build_execution_outcome_summary(
+    outcome_counts: Counter[str],
+    *,
+    total_samples: int,
+) -> tuple[dict[str, int], dict[str, float]]:
+    ordered_counts: dict[str, int] = {
+        key: int(outcome_counts.get(key, 0)) for key in _KNOWN_EXECUTION_OUTCOMES
+    }
+    for key in sorted(outcome_counts):
+        if key not in ordered_counts:
+            ordered_counts[key] = int(outcome_counts[key])
+
+    ordered_rates = {
+        key: (value / total_samples if total_samples else 0.0)
+        for key, value in ordered_counts.items()
+    }
+    return ordered_counts, ordered_rates
 
 
 def score_predicted_prolog(scorable_item: tuple[str, str]) -> tuple[int, int, PrologExecutionResult]:
@@ -211,6 +249,7 @@ class PrologAccuracyCallback(TrainerCallback):
 
         exec_ok = 0
         correct = 0
+        execution_outcome_counts: Counter[str] = Counter()
         batch_size = self.generation_batch_size
         executor: ThreadPoolExecutor | None = None
         padding_side_original = getattr(self.tokenizer, "padding_side", None)
@@ -235,7 +274,7 @@ class PrologAccuracyCallback(TrainerCallback):
                 pending_scores: set[Future[tuple[int, int, PrologExecutionResult]]] = set()
 
                 def _consume_done_scores(*, block: bool) -> None:
-                    nonlocal exec_ok, correct, pending_scores
+                    nonlocal exec_ok, correct, execution_outcome_counts, pending_scores
                     if not pending_scores:
                         return
                     if block:
@@ -248,9 +287,10 @@ class PrologAccuracyCallback(TrainerCallback):
                         )
                     pending_scores = set(not_done)
                     for future in done:
-                        exec_ok_inc, correct_inc, _ = future.result()
+                        exec_ok_inc, correct_inc, exec_result = future.result()
                         exec_ok += exec_ok_inc
                         correct += correct_inc
+                        execution_outcome_counts[_resolve_execution_outcome_name(exec_result)] += 1
                         exec_pbar.update(1)
 
                 for batch_start in range(0, n, batch_size):
@@ -317,9 +357,10 @@ class PrologAccuracyCallback(TrainerCallback):
                     gen_pbar.update(len(batch_preds))
 
                     if executor is None:
-                        for exec_ok_inc, correct_inc, _ in map(score_predicted_prolog, batch_preds):
+                        for exec_ok_inc, correct_inc, exec_result in map(score_predicted_prolog, batch_preds):
                             exec_ok += exec_ok_inc
                             correct += correct_inc
+                            execution_outcome_counts[_resolve_execution_outcome_name(exec_result)] += 1
                             exec_pbar.update(1)
                     else:
                         for item in batch_preds:
@@ -335,12 +376,22 @@ class PrologAccuracyCallback(TrainerCallback):
 
         acc = correct / n if n else 0.0
         exec_rate = exec_ok / n if n else 0.0
+        execution_outcome_count_summary, execution_outcome_rate_summary = (
+            _build_execution_outcome_summary(
+                execution_outcome_counts,
+                total_samples=n,
+            )
+        )
         result = {
             "step": step,
             "epoch": epoch,
             "samples": n,
             "exec_ok_rate": exec_rate,
             "answer_accuracy": acc,
+            "execution_outcomes": {
+                "counts": execution_outcome_count_summary,
+                "rates": execution_outcome_rate_summary,
+            },
         }
         self.last_result = result
         self.history.append(result)
@@ -349,18 +400,20 @@ class PrologAccuracyCallback(TrainerCallback):
         logging.info(
             (
                 "[%s] Prolog accuracy done at step=%d epoch=%.4f: "
-                "exec_ok_rate=%.4f answer_accuracy=%.4f."
+                "exec_ok_rate=%.4f answer_accuracy=%.4f execution_outcomes=%s."
             ),
             self.__class__.__name__,
             step,
             epoch,
             exec_rate,
             acc,
+            json.dumps(execution_outcome_count_summary, sort_keys=True),
         )
         print(
             (
                 f"[PrologAccuracyCallback] step={step} epoch={epoch:.4f} "
-                f"exec_ok_rate={exec_rate:.4f} answer_accuracy={acc:.4f}"
+                f"exec_ok_rate={exec_rate:.4f} answer_accuracy={acc:.4f} "
+                f"execution_outcomes={json.dumps(execution_outcome_count_summary, sort_keys=True)}"
             ),
             flush=True,
         )
@@ -368,5 +421,10 @@ class PrologAccuracyCallback(TrainerCallback):
         if isinstance(metrics, dict):
             metrics["eval_prolog_exec_ok_rate"] = exec_rate
             metrics["eval_prolog_answer_accuracy"] = acc
+            for outcome_name, outcome_count in execution_outcome_count_summary.items():
+                metrics[f"eval_prolog_{outcome_name}_count"] = outcome_count
+                metrics[f"eval_prolog_{outcome_name}_rate"] = execution_outcome_rate_summary[
+                    outcome_name
+                ]
 
         return control

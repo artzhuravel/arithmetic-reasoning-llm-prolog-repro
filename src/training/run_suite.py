@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
@@ -70,6 +71,45 @@ TEST_SUITES: dict[str, TestSuiteSpec] = {
     "openai_gsm8k_val": TestSuiteSpec(dataset_name="openai_gsm8k", split_name="val"),
     "openai_gsm8k_test": TestSuiteSpec(dataset_name="openai_gsm8k", split_name="test"),
 }
+
+_KNOWN_EXECUTION_OUTCOMES: tuple[str, ...] = (
+    "ok",
+    "no_solution",
+    "syntax_error",
+    "execution_error",
+    "timeout",
+    "dependency_error",
+    "unknown_error",
+)
+
+
+def _resolve_execution_outcome_name(exec_ok: bool, error_type: str | None) -> str:
+    if exec_ok:
+        return "ok"
+    if error_type is None or not error_type.strip():
+        return "unknown_error"
+    return error_type.strip()
+
+
+def _build_execution_outcome_summary(
+    outcome_counts: Counter[str],
+    *,
+    total_rows: int,
+) -> tuple[dict[str, int], dict[str, float]]:
+    ordered_counts: dict[str, int] = {
+        key: int(outcome_counts.get(key, 0)) for key in _KNOWN_EXECUTION_OUTCOMES
+    }
+    for key in sorted(outcome_counts):
+        if key not in ordered_counts:
+            ordered_counts[key] = int(outcome_counts[key])
+
+    ordered_rates = {
+        key: (value / total_rows if total_rows else 0.0)
+        for key, value in ordered_counts.items()
+    }
+    return ordered_counts, ordered_rates
+
+
 def _resolve_test_suite_spec(test_suite: str) -> TestSuiteSpec:
     if test_suite not in TEST_SUITES:
         choices = ", ".join(sorted(TEST_SUITES.keys()))
@@ -263,6 +303,7 @@ def run_evaluation(cfg: EvalConfig) -> dict[str, Any]:
     correct_count = 0
     correct_when_exec_ok_count = 0
     missing_ground_truth_count = 0
+    execution_outcome_counts: Counter[str] = Counter()
 
     score_executor: ThreadPoolExecutor | None = None
     if cfg.workers > 1:
@@ -323,6 +364,9 @@ def run_evaluation(cfg: EvalConfig) -> dict[str, Any]:
                     exec_ok_inc, raw_correct_inc, exec_result = scored_batch[local_idx]
 
                     exec_ok_count += exec_ok_inc
+                    execution_outcome_counts[
+                        _resolve_execution_outcome_name(exec_result.ok, exec_result.error_type)
+                    ] += 1
                     has_expected = bool(expected_batch[local_idx])
                     correct_inc = raw_correct_inc if has_expected else 0
                     correct_count += correct_inc
@@ -358,6 +402,12 @@ def run_evaluation(cfg: EvalConfig) -> dict[str, Any]:
         correct_when_exec_ok_count / exec_ok_count if exec_ok_count else 0.0
     )
     ground_truth_coverage = rows_with_ground_truth / total_rows if total_rows else 0.0
+    execution_outcome_count_summary, execution_outcome_rate_summary = (
+        _build_execution_outcome_summary(
+            execution_outcome_counts,
+            total_rows=total_rows,
+        )
+    )
 
     summary: dict[str, Any] = {
         "timestamp_utc": datetime.utcnow().isoformat() + "Z",
@@ -396,6 +446,10 @@ def run_evaluation(cfg: EvalConfig) -> dict[str, Any]:
             "answer_accuracy": answer_accuracy,
             "answer_accuracy_on_exec_ok": answer_accuracy_on_exec_ok,
         },
+        "execution_outcomes": {
+            "counts": execution_outcome_count_summary,
+            "rates": execution_outcome_rate_summary,
+        },
         "runtime_seconds": elapsed_s,
         "artifacts": {
             "summary_json": str(cfg.output_dir / "summary.json"),
@@ -425,6 +479,7 @@ def run_evaluation(cfg: EvalConfig) -> dict[str, Any]:
     )
     if trace_path is not None:
         print(f"[Eval] trace={trace_path}")
+    print(f"[Eval] execution_outcomes={json.dumps(execution_outcome_count_summary, sort_keys=True)}")
 
     return summary
 
