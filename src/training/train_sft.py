@@ -71,7 +71,7 @@ def _configure_runtime_warning_filters() -> None:
 
 @dataclass(frozen=True)
 class CustomCallbacksConfig:
-    enabled: bool = True
+    enabled: bool = False
     max_samples: int = 100
     eval_every_steps: int = 50
     generation_batch_size: int = 7
@@ -353,7 +353,7 @@ def parse_args() -> tuple[TrainConfig, ModelBuildStrategy]:
         dest="enable_custom_callbacks",
         action="store_false",
     )
-    parser.set_defaults(enable_custom_callbacks=True)
+    parser.set_defaults(enable_custom_callbacks=False)
     parser.add_argument("--custom-callbacks-max-samples", type=int, default=100)
     parser.add_argument("--custom-callbacks-eval-every-steps", type=int, default=50)
     parser.add_argument(
@@ -565,7 +565,7 @@ def build_trainer(cfg: TrainConfig,
                   eval_strategy: str = "steps",
                   eval_steps: int = 20,
                   save_steps: int = 200,
-                  save_strategy: str = "steps",
+                  save_strategy: str = "best",
                   save_total_limit: int = 2,
                   load_best_model_at_end: bool = True,
                   metric_for_best_model: str = "eval_loss",
