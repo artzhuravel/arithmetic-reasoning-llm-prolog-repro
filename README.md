@@ -4,7 +4,9 @@ Independent reproduction of:
 - Xiaocheng Yang, Bingsen Chen, Yik-Cheung Tam. 2024. *Arithmetic Reasoning with LLM: Prolog Generation & Permutation*. NAACL-HLT 2024 (Short), pp. 699–710. DOI: 10.18653/v1/2024.naacl-short.61
   - Paper: https://aclanthology.org/2024.naacl-short.61/
 
-This repository is not affiliated with the paper authors.
+This repository reproduces an arithmetic-reasoning pipeline in which a language model is trained to generate Prolog programs for GSM8K-style word problems, execute them with SWI-Prolog, and compare the resulting answers against curated ground truth. The retained experiments cover ordinary Prolog SFT (that is, supervised fine-tuning on the original Prolog-formatted dataset without PROPER-style permutation augmentation), a paperstyle-close PROPER SFT track (that is, supervised fine-tuning on a training set augmented with execution-validated permutations of correct Prolog programs), and an additional GRPO reinforcement-learning stage built on top of the best supervised checkpoint.
+
+In the retained artifact set, the strongest ordinary SFT model reaches 54.30% answer accuracy on `gsm8k_prolog_test`, and the best retained RL run improves that to 58.71% while also slightly increasing execution success. The PROPER run did not beat the corresponding ordinary SFT run in this repository.
 
 ## Reproduction Report
 
