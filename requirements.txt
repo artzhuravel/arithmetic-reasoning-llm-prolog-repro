@@ -1,6 +1,5 @@
 # Core (data, prolog)
 datasets
-pyswip
 
 # Training (SFT, LoRA)
 peft
